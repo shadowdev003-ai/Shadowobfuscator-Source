@@ -1,0 +1,254 @@
+import logging
+import os
+import re
+import base64
+import asyncio
+import requests
+import random
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
+TOKEN = ""
+
+logging.basicConfig(level=logging.INFO)
+
+class WRDDecrypter:
+    def __init__(self):
+        self.layers_decoded = []
+        self.current_stage = 0
+        
+    async def get_ai_progress(self, stage, code_sample):
+        prompts = {
+            1: f"Stage {stage}/9: Deobfuscating VM tables and Base64",
+            2: f"Stage {stage}/9: Breaking arithmetic obfuscation",
+            3: f"Stage {stage}/9: Reversing string encryption",
+            4: f"Stage {stage}/9: Unpacking VM bytecode",
+            5: f"Stage {stage}/9: Resolving control flow",
+            6: f"Stage {stage}/9: Reconstructing functions",
+            7: f"Stage {stage}/9: Removing anti-tamper",
+            8: f"Stage {stage}/9: Cleaning syntax",
+            9: f"Stage {stage}/9: Final reconstruction"
+        }
+        
+        try:
+            url = f"https://text.pollinations.ai/{requests.utils.quote(prompts.get(stage, 'Processing'))}?model=openai"
+            r = await asyncio.to_thread(requests.get, url, timeout=10)
+            if r.status_code == 200 and r.text.strip():
+                return f"Stage {stage}/9: {r.text.strip()[:150]}"
+        except:
+            pass
+            
+        fallback = {
+            1: "Stage 1/9: VM tables and Base64 extraction",
+            2: "Stage 2/9: Arithmetic deobfuscation",
+            3: "Stage 3/9: String decryption",
+            4: "Stage 4/9: VM bytecode unpacking",
+            5: "Stage 5/9: Control flow restoration",
+            6: "Stage 6/9: Function reconstruction",
+            7: "Stage 7/9: Anti-tamper removal",
+            8: "Stage 8/9: Syntax cleaning",
+            9: "Stage 9/9: Final code generation"
+        }
+        return fallback.get(stage, f"Stage {stage}/9: Processing")
+
+    def layer1_vm_unpacker(self, code):
+        def decode_b64(s):
+            try:
+                s = s.strip('"\' ')
+                p = '=' * (4 - len(s) % 4)
+                d = base64.b64decode(s + p).decode('utf-8', errors='ignore')
+                return d if len(d) > 2 else s
+            except:
+                return s
+        
+        table_pattern = r'local\s+([A-Za-z0-9_]+)\s*=\s*\{(.*?)\}'
+        matches = list(re.finditer(table_pattern, code, re.DOTALL))
+        
+        for match in matches:
+            var_name = match.group(1)
+            content = match.group(2)
+            items = re.findall(r'["\']([^"\']+)["\']', content)
+            decoded_items = [decode_b64(item) for item in items]
+            
+            for i, item in enumerate(decoded_items, 1):
+                code = code.replace(f'{var_name}[{i}]', f'"{item}"')
+        
+        b64_pattern = r'["\']([A-Za-z0-9+/=]{10,})["\']'
+        
+        def replace_b64(m):
+            decoded = decode_b64(m.group(1))
+            return f'"{decoded}"' if len(decoded) > 2 else m.group(0)
+        
+        code = re.sub(b64_pattern, replace_b64, code)
+        return code
+
+    def layer2_arithmetic_crusher(self, code):
+        def eval_math(expr):
+            try:
+                clean_expr = re.sub(r'\b0+(\d+)', r'\1', str(expr))
+                return str(eval(clean_expr))
+            except:
+                return str(expr)
+        
+        for _ in range(500):
+            new_code = re.sub(r'(-?\d+\.?\d*[\+\-\*\/]\(?\s?-?\d+\.?\d*\s?\)?)', lambda m: eval_math(m.group(0)), code)
+            if new_code == code:
+                break
+            code = new_code
+        
+        code = re.sub(r'\[(-?\d+[\+\-]\d+)\]', lambda m: f'[{eval_math(m.group(1))}]', code)
+        return code
+
+    def layer3_string_decoder(self, code):
+        def decode_escapes(match):
+            try:
+                return chr(int(match.group(1)))
+            except:
+                return match.group(0)
+        
+        code = re.sub(r'\\(\d{1,3})', decode_escapes, code)
+        code = re.sub(r'\\x([0-9A-Fa-f]{2})', lambda m: chr(int(m.group(1), 16)), code)
+        return code
+
+    def layer4_control_flow(self, code):
+        code = re.sub(r'while\s+true\s+do\s+if\s+not\s*\((.*?)\)\s+then\s+break\s+end', r'while \1 do', code)
+        code = re.sub(r'repeat\s+(.*?)\s+until\s+not\s*\((.*?)\)', r'while \2 do \1 end', code)
+        code = re.sub(r'if\s*\((.*?)\)\s*then\s*(.*?)\s*else\s*break\s+end', r'if not (\1) then break end \2', code)
+        return code
+
+    def layer5_dead_code(self, code):
+        code = re.sub(r'local\s+\w+\s*=\s*\d+\s*[\+\-]\s*\d+', '', code)
+        code = re.sub(r'\blocal\s+\w+\s*=\s*\w+\s*;?\s*\n', '', code)
+        code = re.sub(r'\(\s*(-?\d+)\s*\)', lambda m: m.group(1), code)
+        code = re.sub(r'local\s+\w+\s*=\s*\{\s*\}', '', code)
+        return code
+
+    def layer6_function_restore(self, code):
+        code = re.sub(r'(\w+)\s*=\s*function\s*\((.*?)\)', r'function \1(\2)', code)
+        code = re.sub(r'local\s+function\s+(\w+)', r'function \1', code)
+        return code
+
+    def layer7_anti_tamper(self, code):
+        code = re.sub(r'if\s+\w+\s*~=\s*\w+\s*then\s*return\s+end', '', code)
+        code = re.sub(r'if\s*#\{\s*\}\s*~=\s*\d+\s*then\s*return\s+end', '', code)
+        code = re.sub(r'assert\s*\(\s*false[^)]*\)', '', code)
+        code = re.sub(r'if\s+not\s+\w+\s*then\s*return\s+end', '', code)
+        code = re.sub(r'if\s+type\(\w+\)\s*~=\s*["\']function["\']\s*then\s*return\s+end', '', code)
+        return code
+
+    def layer8_syntax_clean(self, code):
+        code = re.sub(r';\s*\n', '\n', code)
+        code = re.sub(r'\n\s*\n+', '\n\n', code)
+        code = re.sub(r'[ \t]+', ' ', code)
+        code = re.sub(r'\s*([=,\(\)\{\}\[\]])\s*', r'\1', code)
+        code = re.sub(r'\s+', ' ', code)
+        code = re.sub(r'\n ', '\n', code)
+        return code
+
+    async def layer9_ai_reconstruct(self, code):
+        try:
+            prompt = f"Fully deobfuscate this Lua code. Remove all obfuscation, restore original logic, return only clean Lua code:\\n\\n{code[:4000]}"
+            url = f"https://text.pollinations.ai/{requests.utils.quote(prompt)}?model=openai"
+            r = await asyncio.to_thread(requests.get, url, timeout=120)
+            if r.status_code == 200:
+                text = r.text.strip()
+                cleaned = re.sub(r'```(?:lua)?\n(.*?)\n```', r'\1', text, flags=re.DOTALL).strip()
+                return cleaned if len(cleaned) > 100 else code
+        except:
+            pass
+        return code
+
+    def beautify(self, code):
+        code = re.sub(r'\s+', ' ', code)
+        code = code.replace('then', 'then\n').replace('do', 'do\n').replace('else', '\nelse\n').replace('elseif', '\nelseif ').replace('end', '\nend\n').replace('function', '\nfunction')
+        
+        lines = [line.strip() for line in code.split('\n') if line.strip()]
+        result = []
+        indent = 0
+        
+        for line in lines:
+            if any(line.startswith(x) for x in ['end', 'until', 'else', 'elseif']):
+                indent = max(0, indent - 1)
+            
+            result.append('    ' * indent + line)
+            
+            if any(x in line for x in ['then', 'do', 'function']) and 'end' not in line:
+                indent += 1
+            if line.startswith('end') or line.startswith('until'):
+                indent = max(0, indent - 1)
+        
+        return '\n'.join(result)
+
+    async def decrypt(self, code, progress_callback):
+        stages = [
+            self.layer1_vm_unpacker,
+            self.layer2_arithmetic_crusher,
+            self.layer3_string_decoder,
+            self.layer4_control_flow,
+            self.layer5_dead_code,
+            self.layer6_function_restore,
+            self.layer7_anti_tamper,
+            self.layer8_syntax_clean,
+            self.layer9_ai_reconstruct
+        ]
+        
+        current_code = code
+        
+        for i, func in enumerate(stages, 1):
+            self.current_stage = i
+            progress_msg = await self.get_ai_progress(i, current_code)
+            await progress_callback(progress_msg)
+            
+            if asyncio.iscoroutinefunction(func):
+                current_code = await func(current_code)
+            else:
+                current_code = func(current_code)
+            
+            self.layers_decoded.append({
+                'stage': i,
+                'code': current_code[:500]
+            })
+            
+            await asyncio.sleep(0.3)
+        
+        return self.beautify(current_code)
+
+decrypter = WRDDecrypter()
+
+async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("Starting WRD 9-Layer Decryption...")
+    
+    try:
+        doc = update.message.document
+        file = await doc.get_file()
+        raw = requests.get(file.file_path).text
+        
+        async def update_progress(text):
+            await msg.edit_text(text)
+        
+        final_code = await decrypter.decrypt(raw, update_progress)
+        
+        base_name = doc.file_name.replace('.lua', '') if doc.file_name.endswith('.lua') else doc.file_name
+        filename = f"decrypted_{base_name}_{random.randint(1000,9999)}.lua"
+        
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(final_code)
+        
+        with open(filename, 'rb') as f:
+            await update.message.reply_document(document=f, filename=filename)
+        
+        os.remove(filename)
+        await msg.delete()
+        
+    except Exception as e:
+        error_msg = str(e)
+        await msg.edit_text(f"Error: {error_msg}")
+
+def main():
+    app = Application.builder().token(TOKEN).connect_timeout(60).read_timeout(60).build()
+    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("WRD Decrypter Ready")))
+    app.add_handler(MessageHandler(filters.Document.ALL, process_file))
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
