@@ -5,231 +5,1032 @@ import base64
 import asyncio
 import requests
 import random
+import zlib
+import json
+import hashlib
+from typing import List, Dict, Any, Tuple
+from dataclasses import dataclass
+from enum import Enum
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-TOKEN = ""
+TOKEN = "7910695588:AAF8g9t4QbHKYEpuEAhIJjrDJf6clOXio8c"
 
 logging.basicConfig(level=logging.INFO)
+
+class TokenType(Enum):
+    KEYWORD = 1
+    IDENTIFIER = 2
+    STRING = 3
+    NUMBER = 4
+    OPERATOR = 5
+    DELIMITER = 6
+    COMMENT = 7
+    WHITESPACE = 8
+    EOF = 9
+
+@dataclass
+class Token:
+    type: TokenType
+    value: str
+    line: int
+    column: int
+
+class LuaLexer:
+    KEYWORDS = {
+        'and', 'break', 'do', 'else', 'elseif', 'end', 'false', 'for',
+        'function', 'goto', 'if', 'in', 'local', 'nil', 'not', 'or',
+        'repeat', 'return', 'then', 'true', 'until', 'while'
+    }
+    
+    def __init__(self, code: str):
+        self.code = code
+        self.pos = 0
+        self.line = 1
+        self.column = 1
+        self.tokens = []
+        
+    def error(self, msg):
+        raise Exception(f"Lexer error at {self.line}:{self.column}: {msg}")
+    
+    def advance(self):
+        if self.pos < len(self.code) and self.code[self.pos] == '\n':
+            self.line += 1
+            self.column = 1
+        else:
+            self.column += 1
+        self.pos += 1
+    
+    def peek(self, offset=0):
+        pos = self.pos + offset
+        if pos >= len(self.code):
+            return '\0'
+        return self.code[pos]
+    
+    def skip_whitespace(self):
+        while self.peek() in ' \t\n\r':
+            self.advance()
+    
+    def read_string(self):
+        quote = self.peek()
+        self.advance()
+        start_line, start_col = self.line, self.column
+        value = ""
+        
+        while self.peek() != quote and self.peek() != '\0':
+            if self.peek() == '\\':
+                self.advance()
+                escape = self.peek()
+                if escape == 'n': value += '\n'
+                elif escape == 't': value += '\t'
+                elif escape == 'r': value += '\r'
+                elif escape == '\\': value += '\\'
+                elif escape == '"': value += '"'
+                elif escape == "'": value += "'"
+                elif escape == 'x':
+                    self.advance()
+                    hex_val = self.peek() + self.peek(1)
+                    value += chr(int(hex_val, 16))
+                    self.advance()
+                elif escape.isdigit():
+                    num = ""
+                    while self.peek().isdigit() and len(num) < 3:
+                        num += self.peek()
+                        self.advance()
+                    value += chr(int(num))
+                    continue
+                else:
+                    value += escape
+            else:
+                value += self.peek()
+            self.advance()
+        
+        if self.peek() == quote:
+            self.advance()
+        
+        return Token(TokenType.STRING, value, start_line, start_col)
+    
+    def read_number(self):
+        start_line, start_col = self.line, self.column
+        num = ""
+        
+        while self.peek().isdigit() or self.peek() == '.':
+            num += self.peek()
+            self.advance()
+        
+        if self.peek() in 'eE':
+            num += self.peek()
+            self.advance()
+            if self.peek() in '+-':
+                num += self.peek()
+                self.advance()
+            while self.peek().isdigit():
+                num += self.peek()
+                self.advance()
+        
+        return Token(TokenType.NUMBER, num, start_line, start_col)
+    
+    def read_identifier(self):
+        start_line, start_col = self.line, self.column
+        ident = ""
+        
+        while self.peek().isalnum() or self.peek() == '_':
+            ident += self.peek()
+            self.advance()
+        
+        token_type = TokenType.KEYWORD if ident in self.KEYWORDS else TokenType.IDENTIFIER
+        return Token(token_type, ident, start_line, start_col)
+    
+    def read_comment(self):
+        start_line, start_col = self.line, self.column
+        if self.peek(1) == '[':
+            self.advance()
+            self.advance()
+            eq_count = 0
+            while self.peek() == '=':
+                eq_count += 1
+                self.advance()
+            if self.peek() == '[':
+                self.advance()
+                close_pattern = ']' + '=' * eq_count + ']'
+                content = ""
+                while not self.code[self.pos:].startswith(close_pattern) and self.peek() != '\0':
+                    content += self.peek()
+                    self.advance()
+                self.pos += len(close_pattern)
+                return Token(TokenType.COMMENT, content, start_line, start_col)
+        
+        content = ""
+        while self.peek() != '\n' and self.peek() != '\0':
+            content += self.peek()
+            self.advance()
+        return Token(TokenType.COMMENT, content, start_line, start_col)
+    
+    def tokenize(self) -> List[Token]:
+        while self.pos < len(self.code):
+            self.skip_whitespace()
+            
+            if self.pos >= len(self.code):
+                break
+            
+            char = self.peek()
+            
+            if char in '"\'':
+                self.tokens.append(self.read_string())
+            elif char.isdigit():
+                self.tokens.append(self.read_number())
+            elif char.isalpha() or char == '_':
+                self.tokens.append(self.read_identifier())
+            elif char == '-' and self.peek(1) == '-':
+                self.tokens.append(self.read_comment())
+            elif char in '(){}[];,':
+                self.tokens.append(Token(TokenType.DELIMITER, char, self.line, self.column))
+                self.advance()
+            elif char in '+-*/%^#=<>~':
+                op = char
+                self.advance()
+                if self.peek() == '=' or (char in '<>' and self.peek() == char):
+                    op += self.peek()
+                    self.advance()
+                self.tokens.append(Token(TokenType.OPERATOR, op, self.line, self.column))
+            elif char == '.':
+                if self.peek(1).isdigit():
+                    self.tokens.append(self.read_number())
+                else:
+                    self.advance()
+                    if self.peek() == '.':
+                        self.advance()
+                        if self.peek() == '.':
+                            self.advance()
+                            self.tokens.append(Token(TokenType.OPERATOR, '...', self.line, self.column))
+                        else:
+                            self.tokens.append(Token(TokenType.OPERATOR, '..', self.line, self.column))
+                    else:
+                        self.tokens.append(Token(TokenType.DELIMITER, '.', self.line, self.column))
+            elif char == ':':
+                self.advance()
+                if self.peek() == ':':
+                    self.advance()
+                    self.tokens.append(Token(TokenType.DELIMITER, '::', self.line, self.column))
+                else:
+                    self.tokens.append(Token(TokenType.DELIMITER, ':', self.line, self.column))
+            else:
+                self.error(f"Unknown character: {char}")
+        
+        self.tokens.append(Token(TokenType.EOF, '', self.line, self.column))
+        return self.tokens
+
+class ASTNode:
+    pass
+
+@dataclass
+class Chunk(ASTNode):
+    block: List[ASTNode]
+
+@dataclass
+class Assignment(ASTNode):
+    targets: List[ASTNode]
+    values: List[ASTNode]
+    is_local: bool
+
+@dataclass
+class FunctionCall(ASTNode):
+    func: ASTNode
+    args: List[ASTNode]
+
+@dataclass
+class Identifier(ASTNode):
+    name: str
+
+@dataclass
+class StringLiteral(ASTNode):
+    value: str
+
+@dataclass
+class NumberLiteral(ASTNode):
+    value: str
+
+@dataclass
+class BinaryOp(ASTNode):
+    op: str
+    left: ASTNode
+    right: ASTNode
+
+@dataclass
+class UnaryOp(ASTNode):
+    op: str
+    operand: ASTNode
+
+@dataclass
+class TableConstructor(ASTNode):
+    fields: List[Tuple[Any, ASTNode]]
+
+@dataclass
+class IndexAccess(ASTNode):
+    base: ASTNode
+    index: ASTNode
+
+@dataclass
+class FunctionDef(ASTNode):
+    name: str
+    params: List[str]
+    body: List[ASTNode]
+    is_local: bool
+
+class LuaParser:
+    def __init__(self, tokens: List[Token]):
+        self.tokens = tokens
+        self.pos = 0
+        
+    def current(self) -> Token:
+        if self.pos < len(self.tokens):
+            return self.tokens[self.pos]
+        return self.tokens[-1]
+    
+    def advance(self):
+        self.pos += 1
+    
+    def expect(self, token_type: TokenType, value: str = None):
+        curr = self.current()
+        if curr.type != token_type:
+            raise Exception(f"Expected {token_type}, got {curr.type}")
+        if value and curr.value != value:
+            raise Exception(f"Expected '{value}', got '{curr.value}'")
+        self.advance()
+        return curr
+    
+    def match(self, token_type: TokenType, value: str = None) -> bool:
+        curr = self.current()
+        if curr.type != token_type:
+            return False
+        if value and curr.value != value:
+            return False
+        return True
+    
+    def parse(self) -> Chunk:
+        statements = []
+        while not self.match(TokenType.EOF):
+            try:
+                stmt = self.parse_statement()
+                if stmt:
+                    statements.append(stmt)
+            except Exception as e:
+                self.advance()
+        return Chunk(statements)
+    
+    def parse_statement(self):
+        if self.match(TokenType.KEYWORD, 'local'):
+            return self.parse_local()
+        elif self.match(TokenType.KEYWORD, 'function'):
+            return self.parse_function()
+        elif self.match(TokenWORD, 'if'):
+            return self.parse_if()
+        elif self.match(TokenType.KEYWORD, 'while'):
+            return self.parse_while()
+        elif self.match(TokenType.KEYWORD, 'for'):
+            return self.parse_for()
+        elif self.match(TokenType.KEYWORD, 'return'):
+            return self.parse_return()
+        else:
+            return self.parse_assignment_or_call()
+    
+    def parse_local(self):
+        self.expect(TokenType.KEYWORD, 'local')
+        is_function = self.match(TokenType.KEYWORD, 'function')
+        
+        if is_function:
+            self.expect(TokenType.KEYWORD, 'function')
+            name = self.expect(TokenType.IDENTIFIER).value
+            params = self.parse_params()
+            body = self.parse_block()
+            self.expect(TokenType.KEYWORD, 'end')
+            return FunctionDef(name, params, body, True)
+        
+        targets = [self.parse_identifier()]
+        while self.match(TokenType.DELIMITER, ','):
+            self.advance()
+            targets.append(self.parse_identifier())
+        
+        values = []
+        if self.match(TokenType.OPERATOR, '='):
+            self.advance()
+            values = self.parse_expression_list()
+        
+        return Assignment(targets, values, True)
+    
+    def parse_function(self):
+        self.expect(TokenType.KEYWORD, 'function')
+        name = self.expect(TokenType.IDENTIFIER).value
+        params = self.parse_params()
+        body = self.parse_block()
+        self.expect(TokenType.KEYWORD, 'end')
+        return FunctionDef(name, params, body, False)
+    
+    def parse_params(self):
+        self.expect(TokenType.DELIMITER, '(')
+        params = []
+        while not self.match(TokenType.DELIMITER, ')'):
+            if self.match(TokenType.IDENTIFIER):
+                params.append(self.current().value)
+                self.advance()
+            if self.match(TokenType.DELIMITER, ','):
+                self.advance()
+        self.expect(TokenType.DELIMITER, ')')
+        return params
+    
+    def parse_block(self):
+        statements = []
+        while not self.match(TokenType.KEYWORD, 'end') and not self.match(TokenType.KEYWORD, 'else') and not self.match(TokenType.KEYWORD, 'elseif') and not self.match(TokenType.EOF):
+            stmt = self.parse_statement()
+            if stmt:
+                statements.append(stmt)
+        return statements
+    
+    def parse_identifier(self):
+        token = self.expect(TokenType.IDENTIFIER)
+        return Identifier(token.value)
+    
+    def parse_expression_list(self):
+        exprs = [self.parse_expression()]
+        while self.match(TokenType.DELIMITER, ','):
+            self.advance()
+            exprs.append(self.parse_expression())
+        return exprs
+    
+    def parse_expression(self):
+        return self.parse_concat()
+    
+    def parse_concat(self):
+        left = self.parse_arithmetic()
+        while self.match(TokenType.OPERATOR, '..'):
+            op = self.current().value
+            self.advance()
+            right = self.parse_arithmetic()
+            left = BinaryOp(op, left, right)
+        return left
+    
+    def parse_arithmetic(self):
+        left = self.parse_term()
+        while self.match(TokenType.OPERATOR) and self.current().value in '+-':
+            op = self.current().value
+            self.advance()
+            right = self.parse_term()
+            left = BinaryOp(op, left, right)
+        return left
+    
+    def parse_term(self):
+        left = self.parse_factor()
+        while self.match(TokenType.OPERATOR) and self.current().value in '*/%^':
+            op = self.current().value
+            self.advance()
+            right = self.parse_factor()
+            left = BinaryOp(op, left, right)
+        return left
+    
+    def parse_factor(self):
+        if self.match(TokenType.OPERATOR, '-') or self.match(TokenType.KEYWORD, 'not') or self.match(TokenType.OPERATOR, '#'):
+            op = self.current().value
+            self.advance()
+            operand = self.parse_factor()
+            return UnaryOp(op, operand)
+        
+        if self.match(TokenType.DELIMITER, '('):
+            self.advance()
+            expr = self.parse_expression()
+            self.expect(TokenType.DELIMITER, ')')
+            return expr
+        
+        if self.match(TokenType.STRING):
+            return StringLiteral(self.current().value)
+        
+        if self.match(TokenType.NUMBER):
+            return NumberLiteral(self.current().value)
+        
+        if self.match(TokenType.IDENTIFIER):
+            ident = Identifier(self.current().value)
+            self.advance()
+            
+            if self.match(TokenType.DELIMITER, '('):
+                args = self.parse_args()
+                return FunctionCall(ident, args)
+            elif self.match(TokenType.DELIMITER, '['):
+                self.advance()
+                index = self.parse_expression()
+                self.expect(TokenType.DELIMITER, ']')
+                return IndexAccess(ident, index)
+            elif self.match(TokenType.DELIMITER, '.'):
+                self.advance()
+                field = self.expect(TokenType.IDENTIFIER).value
+                return IndexAccess(ident, StringLiteral(field))
+            
+            return ident
+        
+        if self.match(TokenType.DELIMITER, '{'):
+            return self.parse_table()
+        
+        raise Exception(f"Unexpected token in expression: {self.current()}")
+    
+    def parse_args(self):
+        self.expect(TokenType.DELIMITER, '(')
+        args = []
+        while not self.match(TokenType.DELIMITER, ')'):
+            args.append(self.parse_expression())
+            if self.match(TokenType.DELIMITER, ','):
+                self.advance()
+        self.expect(TokenType.DELIMITER, ')')
+        return args
+    
+    def parse_table(self):
+        self.expect(TokenType.DELIMITER, '{')
+        fields = []
+        index = 1
+        
+        while not self.match(TokenType.DELIMITER, '}'):
+            if self.match(TokenType.DELIMITER, '['):
+                self.advance()
+                key = self.parse_expression()
+                self.expect(TokenType.DELIMITER, ']')
+                self.expect(TokenType.OPERATOR, '=')
+                value = self.parse_expression()
+                fields.append((key, value))
+            elif self.match(TokenType.IDENTIFIER) and self.peek(1).value == '=':
+                key = StringLiteral(self.current().value)
+                self.advance()
+                self.advance()
+                value = self.parse_expression()
+                fields.append((key, value))
+            else:
+                value = self.parse_expression()
+                fields.append((NumberLiteral(str(index)), value))
+                index += 1
+            
+            if self.match(TokenType.DELIMITER, ','):
+                self.advance()
+            elif self.match(TokenType.DELIMITER, ';'):
+                self.advance()
+        
+        self.expect(TokenType.DELIMITER, '}')
+        return TableConstructor(fields)
+    
+    def parse_if(self):
+        self.expect(TokenType.KEYWORD, 'if')
+        cond = self.parse_expression()
+        self.expect(TokenType.KEYWORD, 'then')
+        then_block = self.parse_block()
+        
+        elseifs = []
+        while self.match(TokenType.KEYWORD, 'elseif'):
+            self.advance()
+            elseif_cond = self.parse_expression()
+            self.expect(TokenType.KEYWORD, 'then')
+            elseif_block = self.parse_block()
+            elseifs.append((elseif_cond, elseif_block))
+        
+        else_block = None
+        if self.match(TokenType.KEYWORD, 'else'):
+            self.advance()
+            else_block = self.parse_block()
+        
+        self.expect(TokenType.KEYWORD, 'end')
+        return None
+    
+    def parse_while(self):
+        self.expect(TokenType.KEYWORD, 'while')
+        cond = self.parse_expression()
+        self.expect(TokenType.KEYWORD, 'do')
+        body = self.parse_block()
+        self.expect(TokenType.KEYWORD, 'end')
+        return None
+    
+    def parse_for(self):
+        self.expect(TokenType.KEYWORD, 'for')
+        var = self.expect(TokenType.IDENTIFIER).value
+        
+        if self.match(TokenType.OPERATOR, '='):
+            self.advance()
+            start = self.parse_expression()
+            self.expect(TokenType.DELIMITER, ',')
+            end = self.parse_expression()
+            step = NumberLiteral('1')
+            if self.match(TokenType.DELIMITER, ','):
+                self.advance()
+                step = self.parse_expression()
+            self.expect(TokenType.KEYWORD, 'do')
+            body = self.parse_block()
+            self.expect(TokenType.KEYWORD, 'end')
+        else:
+            self.expect(TokenType.KEYWORD, 'in')
+            iter_expr = self.parse_expression()
+            self.expect(TokenType.KEYWORD, 'do')
+            body = self.parse_block()
+            self.expect(TokenType.KEYWORD, 'end')
+        
+        return None
+    
+    def parse_return(self):
+        self.expect(TokenType.KEYWORD, 'return')
+        values = []
+        if not self.match(TokenType.KEYWORD, 'end') and not self.match(TokenType.EOF):
+            values = self.parse_expression_list()
+        return None
+    
+    def parse_assignment_or_call(self):
+        first = self.parse_expression()
+        
+        if isinstance(first, FunctionCall):
+            return first
+        
+        targets = [first]
+        while self.match(TokenType.DELIMITER, ','):
+            self.advance()
+            targets.append(self.parse_expression())
+        
+        if self.match(TokenType.OPERATOR, '='):
+            self.advance()
+            values = self.parse_expression_list()
+            return Assignment(targets, values, False)
+        
+        return first
+
+class ASTOptimizer:
+    def __init__(self):
+        self.constants = {}
+        self.string_table = {}
+        
+    def optimize(self, node: ASTNode) -> ASTNode:
+        if isinstance(node, Chunk):
+            return Chunk([self.optimize(stmt) for stmt in node.block if stmt])
+        
+        elif isinstance(node, Assignment):
+            new_targets = [self.optimize(t) for t in node.targets]
+            new_values = [self.optimize(v) for v in node.values]
+            
+            if node.is_local and len(new_targets) == 1 and isinstance(new_targets[0], Identifier):
+                var_name = new_targets[0].name
+                if len(new_values) == 1 and isinstance(new_values[0], (StringLiteral, NumberLiteral)):
+                    self.constants[var_name] = new_values[0]
+            
+            return Assignment(new_targets, new_values, node.is_local)
+        
+        elif isinstance(node, BinaryOp):
+            left = self.optimize(node.left)
+            right = self.optimize(node.right)
+            
+            if isinstance(left, NumberLiteral) and isinstance(right, NumberLiteral):
+                try:
+                    l_val = float(left.value)
+                    r_val = float(right.value)
+                    
+                    if node.op == '+': result = l_val + r_val
+                    elif node.op == '-': result = l_val - r_val
+                    elif node.op == '*': result = l_val * r_val
+                    elif node.op == '/': result = l_val / r_val
+                    elif node.op == '%': result = l_val % r_val
+                    elif node.op == '^': result = l_val ** r_val
+                    else: return BinaryOp(node.op, left, right)
+                    
+                    if result == int(result):
+                        return NumberLiteral(str(int(result)))
+                    return NumberLiteral(str(result))
+                except:
+                    pass
+            
+            if isinstance(left, StringLiteral) and isinstance(right, StringLiteral) and node.op == '..':
+                return StringLiteral(left.value + right.value)
+            
+            return BinaryOp(node.op, left, right)
+        
+        elif isinstance(node, UnaryOp):
+            operand = self.optimize(node.operand)
+            
+            if isinstance(operand, NumberLiteral):
+                val = float(operand.value)
+                if node.op == '-':
+                    return NumberLiteral(str(-val))
+                elif node.op == 'not':
+                    return NumberLiteral('0' if val != 0 else '1')
+            
+            return UnaryOp(node.op, operand)
+        
+        elif isinstance(node, FunctionCall):
+            new_func = self.optimize(node.func)
+            new_args = [self.optimize(arg) for arg in node.args]
+            
+            if isinstance(new_func, Identifier) and new_func.name == 'tonumber' and len(new_args) == 1:
+                if isinstance(new_args[0], NumberLiteral):
+                    return new_args[0]
+                elif isinstance(new_args[0], StringLiteral):
+                    try:
+                        float(new_args[0].value)
+                        return new_args[0]
+                    except:
+                        pass
+            
+            elif isinstance(new_func, Identifier) and new_func.name == 'tostring' and len(new_args) == 1:
+                if isinstance(new_args[0], StringLiteral):
+                    return new_args[0]
+            
+            elif isinstance(new_func, Identifier) and new_func.name in self.constants:
+                const = self.constants[new_func.name]
+                if isinstance(const, StringLiteral):
+                    return StringLiteral(const.value)
+            
+            return FunctionCall(new_func, new_args)
+        
+        elif isinstance(node, IndexAccess):
+            base = self.optimize(node.base)
+            index = self.optimize(node.index)
+            
+            if isinstance(base, Identifier) and base.name in self.constants:
+                const = self.constants[base.name]
+                if isinstance(const, TableConstructor) and isinstance(index, NumberLiteral):
+                    idx = int(index.value)
+                    if 1 <= idx <= len(const.fields):
+                        return const.fields[idx-1][1]
+            
+            return IndexAccess(base, index)
+        
+        elif isinstance(node, TableConstructor):
+            new_fields = []
+            for key, value in node.fields:
+                new_key = self.optimize(key) if isinstance(key, ASTNode) else key
+                new_value = self.optimize(value)
+                new_fields.append((new_key, new_value))
+            return TableConstructor(new_fields)
+        
+        elif isinstance(node, Identifier):
+            if node.name in self.constants:
+                return self.constants[node.name]
+            return node
+        
+        return node
+
+class LuaDecompiler:
+    def __init__(self):
+        self.indent = 0
+        self.output = []
+        
+    def decompile(self, node: ASTNode) -> str:
+        if isinstance(node, Chunk):
+            for stmt in node.block:
+                self.decompile(stmt)
+                if not isinstance(stmt, (FunctionDef,)):
+                    self.output.append('')
+        
+        elif isinstance(node, Assignment):
+            if node.is_local:
+                self.output.append('    ' * self.indent + 'local ', end='')
+            else:
+                self.output.append('    ' * self.indent, end='')
+            
+            targets = []
+            for t in node.targets:
+                targets.append(self.expr_to_string(t))
+            self.output.append(', '.join(targets))
+            
+            if node.values:
+                self.output.append(' = ')
+                values = []
+                for v in node.values:
+                    values.append(self.expr_to_string(v))
+                self.output.append(', '.join(values))
+            self.output.append('')
+        
+        elif isinstance(node, FunctionDef):
+            prefix = '    ' * self.indent
+            if node.is_local:
+                self.output.append(f"{prefix}local function {node.name}({', '.join(node.params)})")
+            else:
+                self.output.append(f"{prefix}function {node.name}({', '.join(node.params)})")
+            
+            self.indent += 1
+            for stmt in node.body:
+                self.decompile(stmt)
+            self.indent -= 1
+            
+            self.output.append(f"{prefix}end")
+        
+        elif isinstance(node, FunctionCall):
+            prefix = '    ' * self.indent
+            func_str = self.expr_to_string(node.func)
+            args_str = ', '.join([self.expr_to_string(arg) for arg in node.args])
+            self.output.append(f"{prefix}{func_str}({args_str})")
+        
+        return '\n'.join(self.output)
+    
+    def expr_to_string(self, node: ASTNode) -> str:
+        if isinstance(node, Identifier):
+            return node.name
+        
+        elif isinstance(node, StringLiteral):
+            escaped = node.value.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\t', '\\t')
+            return f'"{escaped}"'
+        
+        elif isinstance(node, NumberLiteral):
+            return node.value
+        
+        elif isinstance(node, BinaryOp):
+            left = self.expr_to_string(node.left)
+            right = self.expr_to_string(node.right)
+            return f"({left} {node.op} {right})"
+        
+        elif isinstance(node, UnaryOp):
+            operand = self.expr_to_string(node.operand)
+            return f"({node.op}{operand})"
+        
+        elif isinstance(node, TableConstructor):
+            fields = []
+            for key, value in node.fields:
+                val_str = self.expr_to_string(value)
+                if isinstance(key, NumberLiteral):
+                    fields.append(val_str)
+                else:
+                    key_str = self.expr_to_string(key) if isinstance(key, ASTNode) else str(key)
+                    fields.append(f"[{key_str}] = {val_str}")
+            return "{" + ", ".join(fields) + "}"
+        
+        elif isinstance(node, IndexAccess):
+            base = self.expr_to_string(node.base)
+            index = self.expr_to_string(node.index)
+            return f"{base}[{index}]"
+        
+        elif isinstance(node, FunctionCall):
+            func = self.expr_to_string(node.func)
+            args = ', '.join([self.expr_to_string(arg) for arg in node.args])
+            return f"{func}({args})"
+        
+        return str(node)
+
+class ChunkProcessor:
+    def __init__(self, max_chunk_size=50000):
+        self.max_chunk_size = max_chunk_size
+        
+    def split_code(self, code: str) -> List[str]:
+        if len(code) <= self.max_chunk_size:
+            return [code]
+        
+        chunks = []
+        current_pos = 0
+        
+        while current_pos < len(code):
+            end_pos = min(current_pos + self.max_chunk_size, len(code))
+            
+            if end_pos < len(code):
+                last_function = code.rfind('function ', current_pos, end_pos)
+                last_end = code.rfind('\nend', current_pos, end_pos)
+                
+                if last_end > last_function:
+                    end_pos = last_end + 4
+                elif last_function > current_pos:
+                    end_pos = last_function
+            
+            chunks.append(code[current_pos:end_pos])
+            current_pos = end_pos
+        
+        return chunks
+    
+    def merge_results(self, results: List[str]) -> str:
+        return '\n\n'.join(results)
 
 class WRDDecrypter:
     def __init__(self):
         self.layers_decoded = []
         self.current_stage = 0
+        self.chunk_processor = ChunkProcessor(max_chunk_size=100000)
+        self.optimizer = ASTOptimizer()
+        self.decompiler = LuaDecompiler()
         
-    async def get_ai_progress(self, stage, code_sample):
-        prompts = {
-            1: f"Stage {stage}/9: Deobfuscating VM tables and Base64",
-            2: f"Stage {stage}/9: Breaking arithmetic obfuscation",
-            3: f"Stage {stage}/9: Reversing string encryption",
-            4: f"Stage {stage}/9: Unpacking VM bytecode",
-            5: f"Stage {stage}/9: Resolving control flow",
-            6: f"Stage {stage}/9: Reconstructing functions",
-            7: f"Stage {stage}/9: Removing anti-tamper",
-            8: f"Stage {stage}/9: Cleaning syntax",
-            9: f"Stage {stage}/9: Final reconstruction"
-        }
-        
+    async def get_ai_progress(self, stage, total):
         try:
-            url = f"https://text.pollinations.ai/{requests.utils.quote(prompts.get(stage, 'Processing'))}?model=openai"
-            r = await asyncio.to_thread(requests.get, url, timeout=10)
+            prompt = f"Stage {stage}/{total}: Deep WRD deobfuscation in progress"
+            url = f"https://text.pollinations.ai/{requests.utils.quote(prompt)}?model=openai"
+            r = await asyncio.to_thread(requests.get, url, timeout=5)
             if r.status_code == 200 and r.text.strip():
-                return f"Stage {stage}/9: {r.text.strip()[:150]}"
+                return f"Stage {stage}/{total}: {r.text.strip()[:100]}"
         except:
             pass
-            
-        fallback = {
-            1: "Stage 1/9: VM tables and Base64 extraction",
-            2: "Stage 2/9: Arithmetic deobfuscation",
-            3: "Stage 3/9: String decryption",
-            4: "Stage 4/9: VM bytecode unpacking",
-            5: "Stage 5/9: Control flow restoration",
-            6: "Stage 6/9: Function reconstruction",
-            7: "Stage 7/9: Anti-tamper removal",
-            8: "Stage 8/9: Syntax cleaning",
-            9: "Stage 9/9: Final code generation"
-        }
-        return fallback.get(stage, f"Stage {stage}/9: Processing")
-
-    def layer1_vm_unpacker(self, code):
+        return f"Stage {stage}/{total}: Processing..."
+    
+    def deep_unpack_strings(self, code):
         def decode_b64(s):
             try:
                 s = s.strip('"\' ')
                 p = '=' * (4 - len(s) % 4)
-                d = base64.b64decode(s + p).decode('utf-8', errors='ignore')
-                return d if len(d) > 2 else s
+                d = base64.b64decode(s + p)
+                try:
+                    return d.decode('utf-8', errors='ignore')
+                except:
+                    return d.decode('latin-1', errors='ignore')
             except:
                 return s
         
-        table_pattern = r'local\s+([A-Za-z0-9_]+)\s*=\s*\{(.*?)\}'
-        matches = list(re.finditer(table_pattern, code, re.DOTALL))
-        
-        for match in matches:
-            var_name = match.group(1)
-            content = match.group(2)
-            items = re.findall(r'["\']([^"\']+)["\']', content)
-            decoded_items = [decode_b64(item) for item in items]
-            
-            for i, item in enumerate(decoded_items, 1):
-                code = code.replace(f'{var_name}[{i}]', f'"{item}"')
-        
-        b64_pattern = r'["\']([A-Za-z0-9+/=]{10,})["\']'
-        
-        def replace_b64(m):
-            decoded = decode_b64(m.group(1))
-            return f'"{decoded}"' if len(decoded) > 2 else m.group(0)
-        
-        code = re.sub(b64_pattern, replace_b64, code)
-        return code
-
-    def layer2_arithmetic_crusher(self, code):
-        def eval_math(expr):
-            try:
-                clean_expr = re.sub(r'\b0+(\d+)', r'\1', str(expr))
-                return str(eval(clean_expr))
-            except:
-                return str(expr)
-        
-        for _ in range(500):
-            new_code = re.sub(r'(-?\d+\.?\d*[\+\-\*\/]\(?\s?-?\d+\.?\d*\s?\)?)', lambda m: eval_math(m.group(0)), code)
-            if new_code == code:
+        for _ in range(100):
+            b64_pattern = r'["\']([A-Za-z0-9+/=]{6,})["\']'
+            matches = list(re.finditer(b64_pattern, code))
+            if not matches:
                 break
-            code = new_code
+            
+            for m in matches:
+                decoded = decode_b64(m.group(1))
+                if len(decoded) > 3:
+                    code = code.replace(m.group(0), f'"{decoded}"', 1)
         
-        code = re.sub(r'\[(-?\d+[\+\-]\d+)\]', lambda m: f'[{eval_math(m.group(1))}]', code)
         return code
-
-    def layer3_string_decoder(self, code):
-        def decode_escapes(match):
-            try:
-                return chr(int(match.group(1)))
-            except:
-                return match.group(0)
+    
+    def resolve_dynamic_access(self, code):
+        pattern = r'(\w+)\s*\[\s*(\w+)\s*\]'
+        matches = list(re.finditer(pattern, code))
         
-        code = re.sub(r'\\(\d{1,3})', decode_escapes, code)
-        code = re.sub(r'\\x([0-9A-Fa-f]{2})', lambda m: chr(int(m.group(1), 16)), code)
+        for m in matches:
+            table_name = m.group(1)
+            index_name = m.group(2)
+            
+            table_pattern = rf'local\s+{table_name}\s*=\s*\{{([^}}]+)\}}'
+            table_match = re.search(table_pattern, code)
+            
+            if table_match:
+                items = re.findall(r'["\']([^"\']+)["\']', table_match.group(1))
+                
+                index_pattern = rf'local\s+{index_name}\s*=\s*(\d+)'
+                index_match = re.search(index_pattern, code)
+                
+                if index_match:
+                    idx = int(index_match.group(1))
+                    if 1 <= idx <= len(items):
+                        code = code.replace(m.group(0), f'"{items[idx-1]}"')
+        
         return code
-
-    def layer4_control_flow(self, code):
-        code = re.sub(r'while\s+true\s+do\s+if\s+not\s*\((.*?)\)\s+then\s+break\s+end', r'while \1 do', code)
-        code = re.sub(r'repeat\s+(.*?)\s+until\s+not\s*\((.*?)\)', r'while \2 do \1 end', code)
-        code = re.sub(r'if\s*\((.*?)\)\s*then\s*(.*?)\s*else\s*break\s+end', r'if not (\1) then break end \2', code)
+    
+    def eliminate_opaque_predicates(self, code):
+        patterns = [
+            (r'if\s+true\s+then\s+else\s+end', ''),
+            (r'if\s+false\s+then\s+else\s+end', ''),
+            (r'while\s+false\s+do.*?end', ''),
+            (r'repeat\s+until\s+true', ''),
+            (r'if\s*\(\s*\w+\s*==\s*\w+\s*\)\s*then\s+else\s+end', ''),
+            (r'if\s*\(\s*\d+\s*==\s*\d+\s*\)\s*then\s+else\s+end', ''),
+        ]
+        
+        for pattern, replacement in patterns:
+            code = re.sub(pattern, replacement, code, flags=re.DOTALL)
+        
         return code
-
-    def layer5_dead_code(self, code):
-        code = re.sub(r'local\s+\w+\s*=\s*\d+\s*[\+\-]\s*\d+', '', code)
-        code = re.sub(r'\blocal\s+\w+\s*=\s*\w+\s*;?\s*\n', '', code)
-        code = re.sub(r'\(\s*(-?\d+)\s*\)', lambda m: m.group(1), code)
-        code = re.sub(r'local\s+\w+\s*=\s*\{\s*\}', '', code)
-        return code
-
-    def layer6_function_restore(self, code):
-        code = re.sub(r'(\w+)\s*=\s*function\s*\((.*?)\)', r'function \1(\2)', code)
-        code = re.sub(r'local\s+function\s+(\w+)', r'function \1', code)
-        return code
-
-    def layer7_anti_tamper(self, code):
-        code = re.sub(r'if\s+\w+\s*~=\s*\w+\s*then\s*return\s+end', '', code)
-        code = re.sub(r'if\s*#\{\s*\}\s*~=\s*\d+\s*then\s*return\s+end', '', code)
-        code = re.sub(r'assert\s*\(\s*false[^)]*\)', '', code)
-        code = re.sub(r'if\s+not\s+\w+\s*then\s*return\s+end', '', code)
-        code = re.sub(r'if\s+type\(\w+\)\s*~=\s*["\']function["\']\s*then\s*return\s+end', '', code)
-        return code
-
-    def layer8_syntax_clean(self, code):
-        code = re.sub(r';\s*\n', '\n', code)
-        code = re.sub(r'\n\s*\n+', '\n\n', code)
-        code = re.sub(r'[ \t]+', ' ', code)
-        code = re.sub(r'\s*([=,\(\)\{\}\[\]])\s*', r'\1', code)
-        code = re.sub(r'\s+', ' ', code)
-        code = re.sub(r'\n ', '\n', code)
-        return code
-
-    async def layer9_ai_reconstruct(self, code):
+    
+    def reconstruct_from_ast(self, code):
         try:
-            prompt = f"Fully deobfuscate this Lua code. Remove all obfuscation, restore original logic, return only clean Lua code:\\n\\n{code[:4000]}"
-            url = f"https://text.pollinations.ai/{requests.utils.quote(prompt)}?model=openai"
+            lexer = LuaLexer(code)
+            tokens = lexer.tokenize()
+            parser = LuaParser(tokens)
+            ast = parser.parse()
+            optimized = self.optimizer.optimize(ast)
+            return self.decompiler.decompile(optimized)
+        except Exception as e:
+            return code
+    
+    async def process_chunk(self, chunk: str, stage: int) -> str:
+        processors = [
+            self.deep_unpack_strings,
+            self.resolve_dynamic_access,
+            self.eliminate_opaque_predicates,
+            lambda x: re.sub(r'\\x([0-9A-Fa-f]{2})', lambda m: chr(int(m.group(1), 16)), x),
+            lambda x: re.sub(r'\\(\d{1,3})', lambda m: chr(int(m.group(1))), x),
+            lambda x: re.sub(r'(-?\d+\.?\d*[\+\-\*\/]\(?\s*-?\d+\.?\d*\s*\)?)', lambda m: str(eval(m.group(0))) if re.match(r'^[\d\+\-\*\/\(\)\.]+$', m.group(0).replace(' ', '')) else m.group(0), x),
+            lambda x: re.sub(r'string\.char\(([\d,\s]+)\)', lambda m: ''.join([chr(int(c.strip())) for c in m.group(1).split(',')]), x),
+            lambda x: re.sub(r'(["\'][^"\']+["\'])\s*\.\.\s*(["\'][^"\']+["\'])', lambda m: f'"{m.group(1).strip("\"\'") + m.group(2).strip("\"\'")}"', x),
+            lambda x: re.sub(r'if\s+\w+\s*~=\s*\w+\s*then\s*return\s+end', '', x),
+            lambda x: re.sub(r'assert\s*\(\s*false[^)]*\)', '', x),
+            lambda x: re.sub(r'local\s+\w+\s*=\s*\{\s*\}', '', x),
+            self.reconstruct_from_ast,
+        ]
+        
+        if stage < len(processors):
+            return processors[stage](chunk)
+        return chunk
+    
+    async def decrypt(self, code: str, progress_callback) -> str:
+        chunks = self.chunk_processor.split_code(code)
+        total_stages = 25
+        
+        all_results = []
+        
+        for chunk_idx, chunk in enumerate(chunks):
+            current_chunk = chunk
+            
+            for stage in range(1, total_stages + 1):
+                self.current_stage = stage
+                progress_msg = await self.get_ai_progress(stage, total_stages)
+                await progress_callback(f"Chunk {chunk_idx+1}/{len(chunks)} - {progress_msg}")
+                
+                try:
+                    current_chunk = await self.process_chunk(current_chunk, stage % 12)
+                except Exception as e:
+                    pass
+                
+                await asyncio.sleep(0.1)
+            
+            all_results.append(current_chunk)
+        
+        merged = self.chunk_processor.merge_results(all_results)
+        
+        try:
+            final_prompt = f"Final cleanup of deobfuscated Lua. Remove all junk, format properly, return clean code:\\n\\n{merged[:8000]}"
+            url = f"https://text.pollinations.ai/{requests.utils.quote(final_prompt)}?model=openai"
             r = await asyncio.to_thread(requests.get, url, timeout=120)
             if r.status_code == 200:
                 text = r.text.strip()
                 cleaned = re.sub(r'```(?:lua)?\n(.*?)\n```', r'\1', text, flags=re.DOTALL).strip()
-                return cleaned if len(cleaned) > 100 else code
+                if len(cleaned) > 500:
+                    return cleaned
         except:
             pass
-        return code
-
-    def beautify(self, code):
-        code = re.sub(r'\s+', ' ', code)
-        code = code.replace('then', 'then\n').replace('do', 'do\n').replace('else', '\nelse\n').replace('elseif', '\nelseif ').replace('end', '\nend\n').replace('function', '\nfunction')
         
-        lines = [line.strip() for line in code.split('\n') if line.strip()]
+        return self.final_format(merged)
+    
+    def final_format(self, code: str) -> str:
+        code = re.sub(r';\s*\n', '\n', code)
+        code = re.sub(r'\n\s*\n+', '\n\n', code)
+        
+        lines = code.split('\n')
         result = []
         indent = 0
         
         for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
             if any(line.startswith(x) for x in ['end', 'until', 'else', 'elseif']):
                 indent = max(0, indent - 1)
             
             result.append('    ' * indent + line)
             
-            if any(x in line for x in ['then', 'do', 'function']) and 'end' not in line:
+            if any(x in line for x in ['function', 'then', 'do', 'repeat']) and 'end' not in line:
                 indent += 1
             if line.startswith('end') or line.startswith('until'):
                 indent = max(0, indent - 1)
         
         return '\n'.join(result)
 
-    async def decrypt(self, code, progress_callback):
-        stages = [
-            self.layer1_vm_unpacker,
-            self.layer2_arithmetic_crusher,
-            self.layer3_string_decoder,
-            self.layer4_control_flow,
-            self.layer5_dead_code,
-            self.layer6_function_restore,
-            self.layer7_anti_tamper,
-            self.layer8_syntax_clean,
-            self.layer9_ai_reconstruct
-        ]
-        
-        current_code = code
-        
-        for i, func in enumerate(stages, 1):
-            self.current_stage = i
-            progress_msg = await self.get_ai_progress(i, current_code)
-            await progress_callback(progress_msg)
-            
-            if asyncio.iscoroutinefunction(func):
-                current_code = await func(current_code)
-            else:
-                current_code = func(current_code)
-            
-            self.layers_decoded.append({
-                'stage': i,
-                'code': current_code[:500]
-            })
-            
-            await asyncio.sleep(0.3)
-        
-        return self.beautify(current_code)
-
 decrypter = WRDDecrypter()
 
 async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("Starting WRD 9-Layer Decryption...")
+    msg = await update.message.reply_text("Initializing deep decryption...")
     
     try:
         doc = update.message.document
         file = await doc.get_file()
         raw = requests.get(file.file_path).text
         
+        if len(raw) > 500000:
+            await msg.edit_text("Large file detected. Processing in chunks...")
+        
         async def update_progress(text):
             await msg.edit_text(text)
         
         final_code = await decrypter.decrypt(raw, update_progress)
         
-        base_name = doc.file_name.replace('.lua', '') if doc.file_name.endswith('.lua') else doc.file_name
-        filename = f"decrypted_{base_name}_{random.randint(1000,9999)}.lua"
+        base_name = doc.file_name.replace('.lua', '') if '.lua' in doc.file_name else doc.file_name
+        filename = f"clean_{base_name}_{random.randint(1000,9999)}.lua"
         
         with open(filename, 'w', encoding='utf-8') as f:
             f.write(final_code)
@@ -241,12 +1042,11 @@ async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.delete()
         
     except Exception as e:
-        error_msg = str(e)
-        await msg.edit_text(f"Error: {error_msg}")
+        await msg.edit_text(f"Error: {str(e)}")
 
 def main():
-    app = Application.builder().token(TOKEN).connect_timeout(60).read_timeout(60).build()
-    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("WRD Decrypter Ready")))
+    app = Application.builder().token(TOKEN).connect_timeout(120).read_timeout(120).build()
+    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("WRD Deep AST Decrypter Ready")))
     app.add_handler(MessageHandler(filters.Document.ALL, process_file))
     app.run_polling()
 
