@@ -1,0 +1,2671 @@
+import re
+import base64
+import zlib
+import ast
+import hashlib
+import random
+import string
+import json
+import math
+import operator
+import threading
+import time
+import io
+import sys
+import types
+import inspect
+import dis
+import marshal
+import struct
+import collections
+import itertools
+import functools
+import typing
+import requests
+import asyncio
+import subprocess
+import os
+import tempfile
+import heapq
+import binascii
+import textwrap
+from typing import Any, Dict, List, Tuple, Optional, Union, Set, Callable
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from abc import ABC, abstractmethod
+from collections import defaultdict, deque
+
+try:
+    import luaparser
+    from luaparser import ast as lua_ast
+    from luaparser.astnodes import *
+    LUA_PARSER_AVAILABLE = True
+except ImportError:
+    LUA_PARSER_AVAILABLE = False
+
+try:
+    from z3 import Solver, Int, BitVec, sat, unsat, unknown, simplify
+    Z3_AVAILABLE = True
+except ImportError:
+    Z3_AVAILABLE = False
+
+try:
+    import lupa
+    from lupa import LuaRuntime
+    LUPA_AVAILABLE = True
+except ImportError:
+    LUPA_AVAILABLE = False
+
+class LocalLLMManager:
+    def __init__(self):
+        self.model_path = None
+        self.process = None
+        self.available = False
+        self._check_availability()
+    
+    def _check_availability(self):
+        try:
+            result = subprocess.run(['ollama', 'list'], capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                self.available = True
+                models = result.stdout.strip().split('\n')
+                if len(models) > 1:
+                    self.model_path = models[1].split()[0]
+        except:
+            pass
+    
+    def generate(self, prompt: str, max_tokens: int = 4000) -> Optional[str]:
+        if not self.available:
+            return None
+        
+        try:
+            result = subprocess.run(
+                ['ollama', 'run', self.model_path, prompt[:2000]],
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except:
+            pass
+        
+        return None
+
+class ShadowAIEngine:
+    def __init__(self):
+        self.endpoints = [
+            {'url': 'https://text.pollinations.ai/{prompt}?model=openai', 'type': 'pollinations'},
+            {'url': 'https://api.deepai.org/api/text-generator', 'type': 'deepai', 'key': 'quickstart-QUdJIGlzIGNvbWluZy4gTmljZSB0byBtZWV0IHlvdSE='},
+            {'url': 'https://api-inference.huggingface.co/models/bigcode/starcoder', 'type': 'huggingface', 'key': None},
+        ]
+        self.local_llm = LocalLLMManager()
+        self.cache = {}
+        self.request_history = []
+        self.fallback_chain = ['local', 'pollinations', 'deepai', 'huggingface']
+    
+    def generate(self, prompt: str, mode: str = 'deobfuscate', max_tokens: int = 4000, prefer_local: bool = False) -> str:
+        if prefer_local and self.local_llm.available:
+            local_result = self.local_llm.generate(prompt, max_tokens)
+            if local_result:
+                return local_result
+        
+        cache_key = hashlib.md5(f"{mode}:{prompt[:500]}".encode()).hexdigest()
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+        
+        formatted_prompt = self._format_prompt(prompt, mode)
+        results = []
+        
+        for source in self.fallback_chain:
+            if source == 'local':
+                if self.local_llm.available:
+                    result = self.local_llm.generate(formatted_prompt, max_tokens)
+                    if result:
+                        results.append(('local', result))
+            else:
+                endpoint = next((e for e in self.endpoints if e['type'] == source), None)
+                if endpoint:
+                    try:
+                        result = self._try_endpoint(endpoint, formatted_prompt, max_tokens)
+                        if result and len(result) > 100:
+                            results.append((source, result))
+                    except:
+                        continue
+        
+        best_result = self._select_best_result([r[1] for r in results], mode)
+        if best_result:
+            self.cache[cache_key] = best_result
+            return best_result
+        
+        return prompt
+    
+    def _format_prompt(self, prompt: str, mode: str) -> str:
+        templates = {
+            'deobfuscate': f"Deobfuscate this Lua code completely. Remove all junk, restore original logic, return clean code only:\n\n{prompt}",
+            'analyze': f"Analyze this obfuscated Lua code. Identify obfuscation techniques, VM patterns, encryption methods:\n\n{prompt}",
+            'optimize': f"Optimize this Lua code for maximum performance. Remove redundancies, simplify expressions:\n\n{prompt}",
+            'beautify': f"Beautify this Lua code perfectly. Fix indentation, add proper spacing, make it readable:\n\n{prompt}",
+            'vm_decode': f"Decode this Lua VM bytecode. Reconstruct original opcodes, resolve constants, return decompiled code:\n\n{prompt}",
+            'security': f"Analyze security risks. Find backdoors, malicious patterns, data exfiltration attempts:\n\n{prompt}",
+            'rename': f"Rename all variables in this Lua code to meaningful names based on context. Return only the renamed code:\n\n{prompt}",
+        }
+        return templates.get(mode, templates['deobfuscate'])
+    
+    def _try_endpoint(self, endpoint: Dict, prompt: str, max_tokens: int) -> Optional[str]:
+        if endpoint['type'] == 'pollinations':
+            url = endpoint['url'].format(prompt=requests.utils.quote(prompt[:3000]))
+            res = requests.get(url, timeout=45)
+            if res.status_code == 200:
+                return self._clean_response(res.text)
+        
+        elif endpoint['type'] == 'deepai':
+            res = requests.post(
+                endpoint['url'],
+                headers={'api-key': endpoint['key']},
+                data={'text': prompt[:3000]},
+                timeout=60
+            )
+            if res.status_code == 200:
+                data = res.json()
+                return self._clean_response(data.get('output', ''))
+        
+        elif endpoint['type'] == 'huggingface':
+            res = requests.post(
+                endpoint['url'],
+                headers={'Authorization': f'Bearer {endpoint["key"]}'} if endpoint['key'] else {},
+                json={'inputs': prompt[:2000], 'parameters': {'max_new_tokens': max_tokens}},
+                timeout=120
+            )
+            if res.status_code == 200:
+                data = res.json()
+                return self._clean_response(data[0].get('generated_text', ''))
+        
+        return None
+    
+    def _clean_response(self, text: str) -> str:
+        text = re.sub(r'```(?:lua)?\n(.*?)\n```', r'\1', text, flags=re.DOTALL)
+        text = re.sub(r'  ', '', text, flags=re.DOTALL)
+        text = re.sub(r'\[思考开始\].*?\[思考结束\]', '', text, flags=re.DOTALL)
+        text = re.sub(r'Here is the (deobfuscated|cleaned|optimized) code:?\s*', '', text, flags=re.IGNORECASE)
+        return text.strip()
+    
+    def _select_best_result(self, results: List[str], mode: str) -> Optional[str]:
+        if not results:
+            return None
+        
+        scored = []
+        for result in results:
+            score = 0
+            if mode == 'deobfuscate':
+                score += len(re.findall(r'function\s+\w+\s*\(', result)) * 10
+                score += len(re.findall(r'local\s+\w+\s*=', result)) * 5
+                score -= len(re.findall(r'[A-Za-z0-9+/]{20,}={0,2}', result)) * 20
+                score -= result.count('[') + result.count(']')
+            elif mode == 'beautify':
+                score += result.count('\n') * 2
+                score += len(re.findall(r'^\s{4}', result, re.MULTILINE)) * 5
+                score -= len(re.findall(r'[ \t]+\n', result)) * 10
+            elif mode == 'vm_decode':
+                score += len(re.findall(r'--\s*\[\d+\]', result)) * 5
+                score += len(re.findall(r'local\s+R\s*\[', result)) * 3
+            
+            score += min(len(result) / 100, 50)
+            scored.append((score, result))
+        
+        scored.sort(reverse=True)
+        return scored[0][1] if scored else None
+    
+    def multi_pass(self, code: str, passes: int = 3, mode: str = 'deobfuscate') -> str:
+        current = code
+        for i in range(passes):
+            current = self.generate(current, mode)
+            time.sleep(0.3)
+        return current
+
+class SafeEvaluator:
+    def __init__(self):
+        self.allowed_ops = {
+            ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+            ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv,
+            ast.Mod: operator.mod, ast.Pow: operator.pow,
+            ast.USub: operator.neg, ast.UAdd: operator.pos,
+            ast.BitAnd: operator.and_, ast.BitOr: operator.or_,
+            ast.BitXor: operator.xor, ast.LShift: operator.lshift,
+            ast.RShift: operator.rshift, ast.Invert: operator.invert,
+        }
+        self.allowed_names = {
+            'abs': abs, 'max': max, 'min': min, 'pow': pow, 'round': round,
+            'sum': sum, 'len': len, 'ord': ord, 'chr': chr,
+            'hex': hex, 'bin': bin, 'oct': oct,
+            'math': math, 'string': string,
+        }
+    
+    def eval(self, expr: str) -> Any:
+        try:
+            tree = ast.parse(expr, mode='eval')
+            return self._eval_node(tree.body)
+        except:
+            return expr
+    
+    def _eval_node(self, node: ast.AST) -> Any:
+        if isinstance(node, ast.Num):
+            return node.n
+        elif isinstance(node, ast.Constant):
+            return node.value
+        elif isinstance(node, ast.BinOp):
+            left = self._eval_node(node.left)
+            right = self._eval_node(node.right)
+            op_type = type(node.op)
+            if op_type in self.allowed_ops:
+                return self.allowed_ops[op_type](left, right)
+            raise ValueError(f"Unsupported operator: {op_type}")
+        elif isinstance(node, ast.UnaryOp):
+            operand = self._eval_node(node.operand)
+            op_type = type(node.op)
+            if op_type in self.allowed_ops:
+                return self.allowed_ops[op_type](operand)
+            raise ValueError(f"Unsupported unary: {op_type}")
+        elif isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id in self.allowed_names:
+                args = [self._eval_node(arg) for arg in node.args]
+                return self.allowed_names[node.func.id](*args)
+            raise ValueError(f"Unsupported call: {node.func}")
+        elif isinstance(node, ast.Name):
+            if node.id in self.allowed_names:
+                return self.allowed_names[node.id]
+            raise ValueError(f"Unknown: {node.id}")
+        elif isinstance(node, ast.Subscript):
+            value = self._eval_node(node.value)
+            slice_val = self._eval_node(node.slice)
+            return value[slice_val]
+        elif isinstance(node, ast.Attribute):
+            value = self._eval_node(node.value)
+            return getattr(value, node.attr)
+        elif isinstance(node, (ast.Tuple, ast.List)):
+            return [self._eval_node(elt) for elt in node.elts]
+        else:
+            raise ValueError(f"Unsupported: {type(node)}")
+
+@dataclass
+class VMInstruction:
+    opcode: int
+    a: int
+    b: int
+    c: int
+    bx: int
+    sbx: int
+    original: int = 0
+    name: str = ""
+    resolved_val: Any = None
+    folded: bool = False
+    execution_count: int = 0
+    next_opcodes: List[int] = field(default_factory=list)
+    
+    def __post_init__(self):
+        if not self.name:
+            self.name = self._get_opcode_name(self.opcode)
+    
+    def _get_opcode_name(self, opcode: int) -> str:
+        opcodes = {
+            0: 'MOVE', 1: 'LOADK', 2: 'LOADBOOL', 3: 'LOADNIL', 4: 'GETUPVAL',
+            5: 'GETGLOBAL', 6: 'GETTABLE', 7: 'SETGLOBAL', 8: 'SETUPVAL', 9: 'SETTABLE',
+            10: 'NEWTABLE', 11: 'SELF', 12: 'ADD', 13: 'SUB', 14: 'MUL', 15: 'DIV',
+            16: 'MOD', 17: 'POW', 18: 'UNM', 19: 'NOT', 20: 'LEN', 21: 'CONCAT',
+            22: 'JMP', 23: 'EQ', 24: 'LT', 25: 'LE', 26: 'TEST', 27: 'TESTSET',
+            28: 'CALL', 29: 'TAILCALL', 30: 'RETURN', 31: 'FORLOOP', 32: 'FORPREP',
+            33: 'TFORLOOP', 34: 'SETLIST', 35: 'CLOSE', 36: 'CLOSURE', 37: 'VARARG',
+        }
+        return opcodes.get(opcode, f'OP_{opcode}')
+
+class ASTTransformer:
+    def __init__(self):
+        self.variable_counter = 0
+        self.variable_map = {}
+        self.constants = {}
+        self.safe_eval = SafeEvaluator()
+    
+    def transform(self, code: str) -> str:
+        if not LUA_PARSER_AVAILABLE:
+            return self._regex_transform(code)
+        
+        try:
+            tree = lua_ast.parse(code)
+            tree = self._fold_constants(tree)
+            tree = self._rename_variables(tree)
+            tree = self._eliminate_dead_code(tree)
+            return lua_ast.to_lua_source(tree)
+        except:
+            return self._regex_transform(code)
+    
+    def _regex_transform(self, code: str) -> str:
+        code = self._fold_constants_regex(code)
+        code = self._rename_variables_regex(code)
+        code = self._eliminate_dead_code_regex(code)
+        return code
+    
+    def _fold_constants(self, node):
+        if isinstance(node, (Number, String, Nil, Boolean)):
+            return node
+        
+        if isinstance(node, BinOp):
+            left = self._fold_constants(node.left)
+            right = self._fold_constants(node.right)
+            
+            if isinstance(left, Number) and isinstance(right, Number):
+                try:
+                    if isinstance(node.op, Add):
+                        return Number(left.n + right.n)
+                    elif isinstance(node.op, Sub):
+                        return Number(left.n - right.n)
+                    elif isinstance(node.op, Mult):
+                        return Number(left.n * right.n)
+                    elif isinstance(node.op, Div):
+                        return Number(left.n / right.n)
+                    elif isinstance(node.op, Mod):
+                        return Number(left.n % right.n)
+                    elif isinstance(node.op, Pow):
+                        return Number(left.n ** right.n)
+                except:
+                    pass
+            
+            node.left = left
+            node.right = right
+            return node
+        
+        if isinstance(node, UnOp):
+            operand = self._fold_constants(node.operand)
+            if isinstance(operand, Number):
+                if isinstance(node.op, UMinus):
+                    return Number(-operand.n)
+                elif isinstance(node.op, Not):
+                    return Boolean(not operand.n)
+            
+            node.operand = operand
+            return node
+        
+        if hasattr(node, 'fields'):
+            for field_name in node.fields:
+                field_value = getattr(node, field_name)
+                if isinstance(field_value, list):
+                    setattr(node, field_name, [self._fold_constants(item) for item in field_value])
+                elif field_value is not None:
+                    setattr(node, field_name, self._fold_constants(field_value))
+        
+        return node
+    
+    def _rename_variables(self, node):
+        if isinstance(node, Name):
+            if node.id not in self.variable_map:
+                self.variable_map[node.id] = f'var_{self.variable_counter}'
+                self.variable_counter += 1
+            node.id = self.variable_map[node.id]
+            return node
+        
+        if hasattr(node, 'fields'):
+            for field_name in node.fields:
+                field_value = getattr(node, field_name)
+                if isinstance(field_value, list):
+                    setattr(node, field_name, [self._rename_variables(item) for item in field_value])
+                elif field_value is not None:
+                    setattr(node, field_name, self._rename_variables(field_value))
+        
+        return node
+    
+    def _eliminate_dead_code(self, node):
+        if isinstance(node, Block):
+            new_body = []
+            for stmt in node.body:
+                if not self._is_dead_code(stmt):
+                    new_body.append(self._eliminate_dead_code(stmt))
+            node.body = new_body
+            return node
+        
+        if hasattr(node, 'fields'):
+            for field_name in node.fields:
+                field_value = getattr(node, field_name)
+                if isinstance(field_value, list):
+                    setattr(node, field_name, [self._eliminate_dead_code(item) for item in field_value])
+                elif field_value is not None:
+                    setattr(node, field_name, self._eliminate_dead_code(field_value))
+        
+        return node
+    
+    def _is_dead_code(self, node):
+        if isinstance(node, LocalAssign):
+            if len(node.values) == 1:
+                value = node.values[0]
+                if isinstance(value, (Number, String, Nil, Boolean, Table)):
+                    return True
+        
+        if isinstance(node, Do):
+            if not node.body:
+                return True
+        
+        if isinstance(node, While):
+            if isinstance(node.test, Boolean) and not node.test.b:
+                return True
+        
+        return False
+    
+    def _fold_constants_regex(self, code: str) -> str:
+        patterns = [
+            (r'(\d+)\s*\+\s*(\d+)', lambda m: str(int(m.group(1)) + int(m.group(2)))),
+            (r'(\d+)\s*-\s*(\d+)', lambda m: str(int(m.group(1)) - int(m.group(2)))),
+            (r'(\d+)\s*\*\s*(\d+)', lambda m: str(int(m.group(1)) * int(m.group(2)))),
+            (r'(\d+)\s*/\s*(\d+)', lambda m: str(int(m.group(1)) // int(m.group(2)))),
+            (r'(\d+)\s*%\s*(\d+)', lambda m: str(int(m.group(1)) % int(m.group(2)))),
+            (r'(\d+)\s*\^\s*(\d+)', lambda m: str(int(m.group(1)) ** int(m.group(2)))),
+            (r'not\s+not\s+(\w+)', r'\1'),
+            (r'true\s+and\s+(\w+)', r'\1'),
+            (r'false\s+and\s+(\w+)', r'false'),
+            (r'true\s+or\s+(\w+)', r'true'),
+            (r'false\s+or\s+(\w+)', r'\1'),
+        ]
+        
+        for pattern, replacement in patterns:
+            code = re.sub(pattern, replacement, code)
+        
+        return code
+    
+    def _rename_variables_regex(self, code: str) -> str:
+        local_pattern = r'local\s+(\w+)'
+        locals_found = re.findall(local_pattern, code)
+        
+        for i, var in enumerate(locals_found):
+            if not var.startswith('var_'):
+                new_name = f'var_{i}'
+                code = re.sub(rf'\b{var}\b', new_name, code)
+        
+        return code
+    
+    def _eliminate_dead_code_regex(self, code: str) -> str:
+        patterns = [
+            r'local\s+\w+\s*=\s*\d+\s*[\+\-]\s*\d+[^;]*',
+            r'\blocal\s+\w+\s*=\s*\w+\s*;?\s*\n',
+            r'local\s+\w+\s*=\s*\{\s*\}',
+            r'local\s+\w+\s*=\s*""',
+            r'local\s+\w+\s*=\s*0\s*;?',
+            r'if\s+true\s+then\s+else\s+end',
+            r'if\s+false\s+then\s+else\s+end',
+            r'while\s+false\s+do.*?end',
+            r'while\s+true\s+do\s*end',
+        ]
+        
+        for pattern in patterns:
+            code = re.sub(pattern, '', code, flags=re.DOTALL)
+        
+        return code
+
+class ControlFlowAnalyzer:
+    def __init__(self):
+        self.cfg = {}
+        self.blocks = []
+        self.z3_solver = Solver() if Z3_AVAILABLE else None
+    
+    def analyze(self, code: str) -> str:
+        self._build_cfg(code)
+        code = self._unflatten_control_flow(code)
+        code = self._solve_opaque_predicates(code)
+        return code
+    
+    def _build_cfg(self, code: str):
+        lines = code.split('\n')
+        self.blocks = []
+        current_block = []
+        
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped:
+                current_block.append((i, stripped))
+                
+                if any(stripped.startswith(x) for x in ['if', 'while', 'for', 'repeat', 'return', 'goto', 'break']):
+                    if current_block:
+                        self.blocks.append(current_block)
+                        current_block = []
+        
+        if current_block:
+            self.blocks.append(current_block)
+        
+        for idx, block in enumerate(self.blocks):
+            self.cfg[idx] = {
+                'lines': block,
+                'successors': [],
+                'predecessors': [],
+            }
+            
+            if idx < len(self.blocks) - 1:
+                self.cfg[idx]['successors'].append(idx + 1)
+    
+    def _unflatten_control_flow(self, code: str) -> str:
+        state_machine_pattern = r'while\s+(\w+)\s*<\s*(\d+)\s*do\s+if\s+\1\s*==\s*(\d+)\s*then'
+        matches = list(re.finditer(state_machine_pattern, code))
+        
+        if len(matches) < 3:
+            return code
+        
+        blocks = []
+        var = matches[0].group(1)
+        
+        for i, match in enumerate(matches):
+            state = match.group(3)
+            end_pos = matches[i+1].start() if i+1 < len(matches) else len(code)
+            block = code[match.start():end_pos]
+            
+            block_clean = re.sub(rf'if\s+{var}\s*==\s*{state}\s+then\s*', '', block)
+            block_clean = re.sub(r'\s*end\s*$', '', block_clean)
+            block_clean = re.sub(rf'{var}\s*=\s*{int(state)+1}', '', block_clean)
+            block_clean = re.sub(rf'while\s+{var}\s*<\s*\d+\s*do', '', block_clean)
+            block_clean = re.sub(r'end\s*$', '', block_clean)
+            
+            blocks.append(block_clean.strip())
+        
+        return '\n\n'.join(blocks)
+    
+    def _solve_opaque_predicates(self, code: str) -> str:
+        if not Z3_AVAILABLE:
+            return code
+        
+        opaque_patterns = [
+            (r'if\s*\((\d+)\s*%\s*(\d+)\s*==\s*(\d+)\)\s*then', self._solve_mod_predicate),
+            (r'if\s*\((\d+)\s*\*\s*(\d+)\s*\+\s*(\d+)\s*==\s*(\d+)\)\s*then', self._solve_linear_predicate),
+            (r'if\s*\((\w+)\s*~\s*(\w+)\s*==\s*0\)\s*then', lambda *args: True),
+        ]
+        
+        for pattern, solver_func in opaque_patterns:
+            for match in re.finditer(pattern, code):
+                result = solver_func(*match.groups())
+                if result is True:
+                    code = code.replace(match.group(0), 'if true then', 1)
+                elif result is False:
+                    code = code.replace(match.group(0), 'if false then', 1)
+        
+        return code
+    
+    def _solve_mod_predicate(self, a, b, c):
+        try:
+            a, b, c = int(a), int(b), int(c)
+            return (a % b) == c
+        except:
+            return None
+    
+    def _solve_linear_predicate(self, a, b, c, d):
+        try:
+            a, b, c, d = int(a), int(b), int(c), int(d)
+            return (a * b + c) == d
+        except:
+            return None
+
+class VMInstruction:
+    def __init__(self, opcode, a, b, c, bx, sbx, original=0, name=""):
+        self.opcode = opcode
+        self.a = a
+        self.b = b
+        self.c = c
+        self.bx = bx
+        self.sbx = sbx
+        self.original = original
+        self.name = name or self._get_opcode_name(opcode)
+        self.resolved_val = None
+        self.folded = False
+        self.execution_count = 0
+        self.next_opcodes = []
+    
+    def _get_opcode_name(self, opcode):
+        opcodes = {
+            0: 'MOVE', 1: 'LOADK', 2: 'LOADBOOL', 3: 'LOADNIL', 4: 'GETUPVAL',
+            5: 'GETGLOBAL', 6: 'GETTABLE', 7: 'SETGLOBAL', 8: 'SETUPVAL', 9: 'SETTABLE',
+            10: 'NEWTABLE', 11: 'SELF', 12: 'ADD', 13: 'SUB', 14: 'MUL', 15: 'DIV',
+            16: 'MOD', 17: 'POW', 18: 'UNM', 19: 'NOT', 20: 'LEN', 21: 'CONCAT',
+            22: 'JMP', 23: 'EQ', 24: 'LT', 25: 'LE', 26: 'TEST', 27: 'TESTSET',
+            28: 'CALL', 29: 'TAILCALL', 30: 'RETURN', 31: 'FORLOOP', 32: 'FORPREP',
+            33: 'TFORLOOP', 34: 'SETLIST', 35: 'CLOSE', 36: 'CLOSURE', 37: 'VARARG',
+        }
+        return opcodes.get(opcode, f'OP_{opcode}')
+
+class ShadowSandbox:
+    def __init__(self):
+        self.virtual_stack = []
+        self.heap = {}
+        self.registers = {}
+        self.constants = {}
+        self.call_stack = []
+        self.execution_trace = []
+        self.memory_snapshots = []
+        self.breakpoints = set()
+        self.watchpoints = {}
+        self.environment = {
+            'print': print,
+            'string': string,
+            'math': math,
+            'table': {},
+            'pairs': lambda x: x.items() if isinstance(x, dict) else enumerate(x),
+            'ipairs': lambda x: enumerate(x),
+            'type': type,
+            'tostring': str,
+            'tonumber': float,
+            'assert': lambda x, y=None: x or (_ for _ in ()).throw(AssertionError(y)),
+            'error': lambda x: (_ for _ in ()).throw(Exception(x)),
+            'pcall': lambda f, *a: (True, f(*a)) if True else (False, None),
+            'xpcall': lambda f, e, *a: (True, f(*a)) if True else (False, e),
+            'rawget': lambda t, k: t.get(k),
+            'rawset': lambda t, k, v: t.__setitem__(k, v),
+            'rawequal': lambda a, b: a is b,
+            'unpack': lambda t, i=1, j=None: list(t[i-1:j]) if j else list(t[i-1:]),
+            'select': lambda n, *a: a[n-1] if n > 0 else len(a),
+            'next': lambda t, k=None: next(iter(t.items())) if k is None else next((kv for kv in t.items() if kv[0] != k), (None, None)),
+            'tostring': str,
+            'tonumber': lambda x, base=10: int(x, base) if base != 10 else float(x),
+            'loadstring': lambda x: compile(x, '<string>', 'exec'),
+            'load': lambda x, *a: compile(x.read() if hasattr(x, 'read') else x, '<string>', 'exec'),
+            'dofile': lambda f: exec(open(f).read()),
+            'require': lambda m: __import__(m),
+        }
+        self.lua_runtime = LuaRuntime(unpack_returned_tuples=True) if LUPA_AVAILABLE else None
+    
+    def simulate_call(self, func_bytes: bytes, args: List[Any]) -> Dict[str, Any]:
+        self.virtual_stack = list(args)
+        self.call_stack.append({'func': func_bytes, 'pc': 0, 'locals': {}, 'upvalues': {}})
+        
+        try:
+            if func_bytes[:4] == b'\x1bLua':
+                result = self._simulate_lua_bytecode(func_bytes)
+            else:
+                result = self._simulate_generic(func_bytes)
+            
+            return {
+                'success': True,
+                'result': result,
+                'trace': self.execution_trace,
+                'heap': self.heap,
+                'memory_snapshots': self.memory_snapshots,
+                'registers': self.registers,
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'error': str(e),
+                'trace': self.execution_trace,
+                'heap': self.heap,
+                'registers': self.registers,
+            }
+    
+    def _simulate_lua_bytecode(self, bytecode: bytes) -> Any:
+        pos = 12
+        
+        def read_int(size: int) -> int:
+            nonlocal pos
+            val = int.from_bytes(bytecode[pos:pos+size], 'little')
+            pos += size
+            return val
+        
+        def read_size_t() -> int:
+            return read_int(4)
+        
+        def read_number() -> float:
+            nonlocal pos
+            return struct.unpack('<d', bytecode[pos:pos+8])[0]
+        
+        def read_string() -> str:
+            nonlocal pos
+            size = read_size_t()
+            if size == 0:
+                return ""
+            result = bytecode[pos:pos+size-1].decode('utf-8', errors='ignore')
+            pos += size
+            return result
+        
+        source_len = read_size_t()
+        pos += source_len
+        
+        line_defined = read_int(4)
+        last_line_defined = read_int(4)
+        num_upvalues = bytecode[pos]
+        pos += 1
+        num_params = bytecode[pos]
+        pos += 1
+        is_vararg = bytecode[pos]
+        pos += 1
+        max_stack_size = bytecode[pos]
+        pos += 1
+        
+        num_instr = read_int(4)
+        instructions = []
+        
+        for _ in range(num_instr):
+            instr = read_int(4)
+            opcode = instr & 0x3F
+            a = (instr >> 6) & 0xFF
+            c = (instr >> 14) & 0x1FF
+            b = (instr >> 23) & 0x1FF
+            bx = (instr >> 14) & 0x3FFFF
+            sbx = bx - 131071
+            
+            instructions.append(VMInstruction(opcode, a, b, c, bx, sbx, instr))
+        
+        num_const = read_int(4)
+        constants = []
+        
+        for _ in range(num_const):
+            const_type = bytecode[pos]
+            pos += 1
+            
+            if const_type == 0:
+                constants.append(None)
+            elif const_type == 1:
+                constants.append(bytecode[pos] != 0)
+                pos += 1
+            elif const_type == 3:
+                constants.append(read_number())
+            elif const_type == 4:
+                constants.append(read_string())
+        
+        self.constants = {i: v for i, v in enumerate(constants)}
+        
+        pc = 0
+        while pc < len(instructions):
+            if pc in self.breakpoints:
+                self.memory_snapshots.append({
+                    'pc': pc,
+                    'registers': dict(self.registers),
+                    'stack': list(self.virtual_stack),
+                })
+            
+            instr = instructions[pc]
+            self.execution_trace.append({
+                'pc': pc,
+                'opcode': instr.name,
+                'a': instr.a,
+                'b': instr.b,
+                'c': instr.c,
+                'bx': instr.bx,
+                'sbx': instr.sbx,
+                'registers': dict(self.registers),
+                'stack': list(self.virtual_stack),
+            })
+            
+            if instr.name == 'MOVE':
+                self.registers[instr.a] = self.registers.get(instr.b, None)
+            
+            elif instr.name == 'LOADK':
+                self.registers[instr.a] = self.constants.get(instr.bx, None)
+            
+            elif instr.name == 'LOADBOOL':
+                self.registers[instr.a] = instr.b != 0
+                if instr.c != 0:
+                    pc += 1
+            
+            elif instr.name == 'LOADNIL':
+                for i in range(instr.a, instr.b + 1):
+                    self.registers[i] = None
+            
+            elif instr.name == 'GETUPVAL':
+                self.registers[instr.a] = self.call_stack[-1]['upvalues'].get(instr.b, None)
+            
+            elif instr.name == 'GETGLOBAL':
+                name = self.constants.get(instr.bx, None)
+                self.registers[instr.a] = self.environment.get(name, None)
+            
+            elif instr.name == 'GETTABLE':
+                table = self.registers.get(instr.b, {})
+                key = self.registers.get(instr.c) if instr.c < 256 else self.constants.get(instr.c - 256, None)
+                self.registers[instr.a] = table.get(key, None) if isinstance(table, dict) else None
+            
+            elif instr.name == 'SETGLOBAL':
+                name = self.constants.get(instr.bx, None)
+                self.environment[name] = self.registers.get(instr.a, None)
+            
+            elif instr.name == 'SETUPVAL':
+                self.call_stack[-1]['upvalues'][instr.b] = self.registers.get(instr.a, None)
+            
+            elif instr.name == 'SETTABLE':
+                table = self.registers.get(instr.a, {})
+                key = self.registers.get(instr.b) if instr.b < 256 else self.constants.get(instr.b - 256, None)
+                value = self.registers.get(instr.c) if instr.c < 256 else self.constants.get(instr.c - 256, None)
+                if isinstance(table, dict):
+                    table[key] = value
+            
+            elif instr.name == 'NEWTABLE':
+                self.registers[instr.a] = {}
+            
+            elif instr.name == 'SELF':
+                self.registers[instr.a + 1] = self.registers.get(instr.b, None)
+                table = self.registers.get(instr.b, {})
+                key = self.constants.get(instr.c, None)
+                self.registers[instr.a] = table.get(key, None) if isinstance(table, dict) else None
+            
+            elif instr.name in ['ADD', 'SUB', 'MUL', 'DIV', 'MOD', 'POW']:
+                left = self.registers.get(instr.b, 0)
+                right = self.registers.get(instr.c, 0)
+                if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+                    ops = {'ADD': operator.add, 'SUB': operator.sub, 'MUL': operator.mul, 
+                           'DIV': operator.truediv, 'MOD': operator.mod, 'POW': operator.pow}
+                    self.registers[instr.a] = ops[instr.name](left, right)
+                else:
+                    self.registers[instr.a] = None
+            
+            elif instr.name == 'UNM':
+                val = self.registers.get(instr.b, 0)
+                self.registers[instr.a] = -val if isinstance(val, (int, float)) else None
+            
+            elif instr.name == 'NOT':
+                val = self.registers.get(instr.b, False)
+                self.registers[instr.a] = not val
+            
+            elif instr.name == 'LEN':
+                val = self.registers.get(instr.b, "")
+                self.registers[instr.a] = len(val) if isinstance(val, (str, list, dict)) else 0
+            
+            elif instr.name == 'CONCAT':
+                result = ""
+                for i in range(instr.b, instr.c + 1):
+                    val = self.registers.get(i, "")
+                    result += str(val)
+                self.registers[instr.a] = result
+            
+            elif instr.name == 'JMP':
+                pc += instr.sbx
+                continue
+            
+            elif instr.name in ['EQ', 'LT', 'LE']:
+                left = self.registers.get(instr.b) if instr.b < 256 else self.constants.get(instr.b - 256, None)
+                right = self.registers.get(instr.c) if instr.c < 256 else self.constants.get(instr.c - 256, None)
+                if instr.b >= 256:
+                    left = self.constants.get(instr.b - 256, None)
+                if instr.c >= 256:
+                    right = self.constants.get(instr.c - 256, None)
+                
+                ops = {'EQ': operator.eq, 'LT': operator.lt, 'LE': operator.le}
+                result = ops[instr.name](left, right)
+                if result != (instr.a != 0):
+                    pc += 1
+            
+            elif instr.name == 'TEST':
+                val = self.registers.get(instr.a, False)
+                if (not val) != (instr.c != 0):
+                    pc += 1
+            
+            elif instr.name == 'TESTSET':
+                val = self.registers.get(instr.b, False)
+                if (not val) != (instr.c != 0):
+                    pc += 1
+                else:
+                    self.registers[instr.a] = val
+            
+            elif instr.name == 'CALL':
+                func = self.registers.get(instr.a, lambda *x: None)
+                num_args = instr.b - 1 if instr.b != 0 else len(self.virtual_stack)
+                num_results = instr.c - 1 if instr.c != 0 else 1
+                
+                args = [self.registers.get(instr.a + i + 1) for i in range(num_args)]
+                
+                if callable(func):
+                    try:
+                        result = func(*args)
+                        if num_results >= 0:
+                            self.registers[instr.a] = result
+                    except:
+                        self.registers[instr.a] = None
+            
+            elif instr.name == 'TAILCALL':
+                func = self.registers.get(instr.a, lambda *x: None)
+                num_args = instr.b - 1 if instr.b != 0 else len(self.virtual_stack)
+                args = [self.registers.get(instr.a + i + 1) for i in range(num_args)]
+                
+                if callable(func):
+                    return func(*args)
+            
+            elif instr.name == 'RETURN':
+                num_returns = instr.b - 1 if instr.b != 0 else len(self.registers) - instr.a
+                returns = [self.registers.get(instr.a + i) for i in range(num_returns)]
+                return returns[0] if returns else None
+            
+            elif instr.name == 'FORLOOP':
+                idx = self.registers.get(instr.a, 0)
+                limit = self.registers.get(instr.a + 1, 0)
+                step = self.registers.get(instr.a + 2, 1)
+                
+                idx += step
+                if (step > 0 and idx <= limit) or (step < 0 and idx >= limit):
+                    self.registers[instr.a] = idx
+                    self.registers[instr.a + 3] = idx
+                    pc += instr.sbx
+                    continue
+            
+            elif instr.name == 'FORPREP':
+                init = self.registers.get(instr.a, 0)
+                limit = self.registers.get(instr.a + 1, 0)
+                step = self.registers.get(instr.a + 2, 1)
+                
+                self.registers[instr.a] = init - step
+                pc += instr.sbx
+                continue
+            
+            elif instr.name == 'TFORLOOP':
+                func = self.registers.get(instr.a, lambda *x: (None, None))
+                state = self.registers.get(instr.a + 1, None)
+                control = self.registers.get(instr.a + 2, None)
+                
+                result = func(state, control)
+                if result:
+                    self.registers[instr.a + 3] = result[0] if isinstance(result, (list, tuple)) else result
+                    self.registers[instr.a + 2] = result[0] if isinstance(result, (list, tuple)) else result
+                else:
+                    pc += 1
+            
+            elif instr.name == 'SETLIST':
+                table = self.registers.get(instr.a, {})
+                if isinstance(table, dict):
+                    for i in range(1, instr.b + 1):
+                        table[instr.c * 50 + i] = self.registers.get(instr.a + i, None)
+            
+            elif instr.name == 'CLOSE':
+                pass
+            
+            elif instr.name == 'CLOSURE':
+                proto_idx = instr.bx
+                self.registers[instr.a] = lambda *args: None
+            
+            elif instr.name == 'VARARG':
+                num_varargs = instr.b - 1 if instr.b != 0 else len(self.virtual_stack)
+                for i in range(num_varargs):
+                    self.registers[instr.a + i] = self.virtual_stack[i] if i < len(self.virtual_stack) else None
+            
+            pc += 1
+        
+        return None
+    
+    def _simulate_generic(self, data: bytes) -> Any:
+        for i, byte in enumerate(data[:1000]):
+            self.heap[f'byte_{i}'] = byte
+        return None
+    
+    def set_breakpoint(self, pc: int):
+        self.breakpoints.add(pc)
+    
+    def set_watchpoint(self, var_name: str, condition: Callable):
+        self.watchpoints[var_name] = condition
+    
+    def get_memory_dump(self) -> Dict[str, Any]:
+        return {
+            'registers': self.registers,
+            'stack': self.virtual_stack,
+            'heap_size': len(self.heap),
+            'call_depth': len(self.call_stack),
+            'constants': self.constants,
+        }
+    
+    def dump_strings(self) -> List[str]:
+        strings = []
+        for v in self.constants.values():
+            if isinstance(v, str) and len(v) > 3:
+                strings.append(v)
+        for v in self.registers.values():
+            if isinstance(v, str) and len(v) > 3:
+                strings.append(v)
+        return strings
+
+class OpcodeBruteforcer:
+    def __init__(self):
+        self.standard_opcodes = {
+            'MOVE': 0, 'LOADK': 1, 'LOADBOOL': 2, 'LOADNIL': 3, 'GETUPVAL': 4,
+            'GETGLOBAL': 5, 'GETTABLE': 6, 'SETGLOBAL': 7, 'SETUPVAL': 8, 'SETTABLE': 9,
+            'NEWTABLE': 10, 'SELF': 11, 'ADD': 12, 'SUB': 13, 'MUL': 14, 'DIV': 15,
+            'MOD': 16, 'POW': 17, 'UNM': 18, 'NOT': 19, 'LEN': 20, 'CONCAT': 21,
+            'JMP': 22, 'EQ': 23, 'LT': 24, 'LE': 25, 'TEST': 26, 'TESTSET': 27,
+            'CALL': 28, 'TAILCALL': 29, 'RETURN': 30, 'FORLOOP': 31, 'FORPREP': 32,
+            'TFORLOOP': 33, 'SETLIST': 34, 'CLOSE': 35, 'CLOSURE': 36, 'VARARG': 37,
+        }
+        self.behavior_signatures = {
+            'LOADK': {'uses_bx': True, 'bx_range': (0, 1000), 'a_range': (0, 50)},
+            'ADD': {'uses_b': True, 'uses_c': True, 'b_range': (0, 10), 'c_range': (0, 10)},
+            'JMP': {'uses_sbx': True, 'sbx_range': (-100, 100)},
+            'CALL': {'uses_a': True, 'uses_b': True, 'a_range': (0, 20), 'b_range': (0, 10)},
+            'RETURN': {'uses_a': True, 'uses_b': True, 'a_range': (0, 20), 'b_range': (0, 10)},
+        }
+        self.learned_mappings = {}
+        self.confidence_threshold = 0.7
+    
+    def bruteforce_opcodes(self, instructions: List[VMInstruction], constants: List[Any]) -> Tuple[Dict[int, str], float]:
+        stats = self._collect_statistics(instructions)
+        mappings = {}
+        
+        for opcode, data in stats.items():
+            guessed = self._guess_by_behavior(data, constants)
+            if guessed:
+                mappings[opcode] = guessed
+                self.learned_mappings[opcode] = guessed
+        
+        confidence = len(mappings) / len(stats) if stats else 0.0
+        
+        if confidence < self.confidence_threshold:
+            mappings = self._advanced_heuristic_analysis(instructions, constants, stats)
+            confidence = len(mappings) / len(stats) if stats else 0.0
+        
+        return mappings, confidence
+    
+    def _collect_statistics(self, instructions: List[VMInstruction]) -> Dict[int, Dict]:
+        stats = {}
+        for i, instr in enumerate(instructions):
+            if instr.opcode not in stats:
+                stats[instr.opcode] = {
+                    'count': 0, 'a_values': [], 'b_values': [], 'c_values': [],
+                    'bx_values': [], 'sbx_values': [], 'next_opcodes': [],
+                    'prev_opcodes': [], 'contexts': [],
+                }
+            
+            stats[instr.opcode]['count'] += 1
+            stats[instr.opcode]['a_values'].append(instr.a)
+            stats[instr.opcode]['b_values'].append(instr.b)
+            stats[instr.opcode]['c_values'].append(instr.c)
+            stats[instr.opcode]['bx_values'].append(instr.bx)
+            stats[instr.opcode]['sbx_values'].append(instr.sbx)
+            
+            if i > 0:
+                stats[instr.opcode]['prev_opcodes'].append(instructions[i-1].opcode)
+            if i < len(instructions) - 1:
+                stats[instr.opcode]['next_opcodes'].append(instructions[i+1].opcode)
+            
+            context = self._get_instruction_context(instructions, i)
+            stats[instr.opcode]['contexts'].append(context)
+        
+        return stats
+    
+    def _get_instruction_context(self, instructions: List[VMInstruction], idx: int) -> Dict:
+        context = {
+            'before': [],
+            'after': [],
+            'distance_to_jump': None,
+        }
+        
+        for i in range(max(0, idx-3), idx):
+            context['before'].append(instructions[i].opcode)
+        
+        for i in range(idx+1, min(len(instructions), idx+4)):
+            context['after'].append(instructions[i].opcode)
+        
+        for i in range(idx+1, len(instructions)):
+            if instructions[i].name == 'JMP' or instructions[i].opcode == 22:
+                context['distance_to_jump'] = i - idx
+                break
+        
+        return context
+    
+    def _guess_by_behavior(self, data: Dict, constants: List[Any]) -> Optional[str]:
+        bx_values = data['bx_values']
+        if bx_values and max(bx_values) > 100 and all(v >= 0 for v in bx_values):
+            if any(v < len(constants) for v in bx_values if v < 1000):
+                return 'LOADK'
+        
+        sbx_values = data['sbx_values']
+        if sbx_values and any(v != 0 for v in sbx_values):
+            if max(abs(v) for v in sbx_values) > 10:
+                return 'JMP'
+        
+        b_values = data['b_values']
+        c_values = data['c_values']
+        if b_values and c_values and max(b_values) < 20 and max(c_values) < 20:
+            if data['count'] > 5:
+                return 'ADD'
+        
+        a_values = data['a_values']
+        if a_values and any(v == 0 for v in a_values):
+            if data.get('next_opcodes') and any(n in [22, 23, 24] for n in data['next_opcodes'][:5]):
+                return 'TEST'
+        
+        return None
+    
+    def _advanced_heuristic_analysis(self, instructions: List[VMInstruction], constants: List[Any], stats: Dict) -> Dict[int, str]:
+        mappings = {}
+        
+        for opcode, data in stats.items():
+            if data['count'] == 1 and any(ctx.get('distance_to_jump') == 1 for ctx in data['contexts']):
+                mappings[opcode] = 'RETURN'
+                continue
+            
+            if data['count'] > 10 and all(b == 0 for b in data['b_values']) and all(c == 0 for c in data['c_values']):
+                if all(a < 10 for a in data['a_values']):
+                    mappings[opcode] = 'LOADNIL'
+                    continue
+            
+            bx_vals = data['bx_values']
+            if bx_vals and len(set(bx_vals)) > len(bx_vals) * 0.8:
+                if all(0 <= v < len(constants) * 2 for v in bx_vals):
+                    mappings[opcode] = 'LOADK'
+                    continue
+            
+            sbx_vals = data['sbx_values']
+            if sbx_vals and len([v for v in sbx_vals if v != 0]) > len(sbx_vals) * 0.5:
+                if max(abs(v) for v in sbx_vals) > 50:
+                    mappings[opcode] = 'JMP'
+                    continue
+            
+            if data.get('next_opcodes'):
+                call_candidates = [n for n in data['next_opcodes'] if n in mappings and mappings[n] == 'CALL']
+                if len(call_candidates) > len(data['next_opcodes']) * 0.3:
+                    mappings[opcode] = 'GETGLOBAL'
+                    continue
+        
+        return mappings
+    
+    def apply_mapping(self, instructions: List[VMInstruction], mappings: Dict[int, str]) -> List[VMInstruction]:
+        for instr in instructions:
+            if instr.opcode in mappings:
+                instr.name = mappings[instr.opcode]
+        return instructions
+    
+    def save_learned_model(self, filepath: str):
+        with open(filepath, 'w') as f:
+            json.dump(self.learned_mappings, f)
+    
+    def load_learned_model(self, filepath: str):
+        with open(filepath, 'r') as f:
+            self.learned_mappings = json.load(f)
+
+class AnalysisDashboard:
+    def __init__(self):
+        self.reports = []
+        self.threat_levels = {
+            'low': 0,
+            'medium': 1,
+            'high': 2,
+            'critical': 3,
+        }
+    
+    def generate_report(self, code: str, deobfuscated: str, metadata: Dict) -> Dict[str, Any]:
+        report = {
+            'timestamp': time.time(),
+            'original_size': len(code),
+            'deobfuscated_size': len(deobfuscated),
+            'compression_ratio': len(deobfuscated) / len(code) if code else 0,
+            'threat_assessment': self._assess_threats(code, deobfuscated),
+            'code_quality': self._assess_quality(deobfuscated),
+            'security_issues': self._find_security_issues(code),
+            'network_indicators': self._extract_network_indicators(code),
+            'file_system_indicators': self._extract_fs_indicators(code),
+            'obfuscation_techniques': self._identify_techniques(code),
+            'recommendations': [],
+        }
+        
+        report['recommendations'] = self._generate_recommendations(report)
+        self.reports.append(report)
+        return report
+    
+    def _assess_threats(self, original: str, deobfuscated: str) -> Dict[str, Any]:
+        threats = []
+        score = 0
+        
+        malicious_patterns = [
+            (r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', 'external_connection', 2),
+            (r'password|token|key|secret|credential', 'credential_access', 3),
+            (r'eval\s*\(|loadstring\s*\(|pcall\s*\(\s*load', 'dynamic_execution', 2),
+            (r'writefile|readfile|appendfile|delfile', 'file_manipulation', 2),
+            (r'setclipboard|toclipboard', 'clipboard_access', 1),
+            (r'hookfunction|replaceclosure|newcclosure', 'function_hooking', 2),
+            (r'getrawmetatable|setrawmetatable', 'metatable_manipulation', 2),
+            (r'debug\.setconstant|debug\.setupvalue', 'debug_manipulation', 3),
+            (r'while\s+true\s+do\s*end|for\s+\w+\s+in\s+pairs\s*\(\s*\{\s*\}\s*\)\s+do\s+end', 'denial_of_service', 2),
+        ]
+        
+        for pattern, threat_type, severity in malicious_patterns:
+            if re.search(pattern, original, re.IGNORECASE):
+                threats.append({'type': threat_type, 'severity': severity})
+                score += severity
+        
+        max_score = len(malicious_patterns) * 3
+        threat_level = 'low' if score < 3 else 'medium' if score < 6 else 'high' if score < 9 else 'critical'
+        
+        return {
+            'score': score,
+            'max_score': max_score,
+            'level': threat_level,
+            'threats': threats,
+        }
+    
+    def _assess_quality(self, code: str) -> Dict[str, Any]:
+        metrics = {
+            'lines_of_code': len(code.split('\n')),
+            'functions': len(re.findall(r'function\s+\w+', code)),
+            'complexity': len(re.findall(r'if|while|for|repeat', code)),
+            'duplication': self._detect_duplication(code),
+            'naming_quality': self._assess_naming(code),
+        }
+        
+        quality_score = 100
+        quality_score -= metrics['complexity'] * 2
+        quality_score -= metrics['duplication'] * 10
+        quality_score -= (10 - metrics['naming_quality']) * 5
+        
+        return {
+            'metrics': metrics,
+            'score': max(0, quality_score),
+            'grade': 'A' if quality_score > 80 else 'B' if quality_score > 60 else 'C' if quality_score > 40 else 'D',
+        }
+    
+    def _detect_duplication(self, code: str) -> int:
+        lines = code.split('\n')
+        unique_lines = set(lines)
+        return len(lines) - len(unique_lines)
+    
+    def _assess_naming(self, code: str) -> int:
+        vars = re.findall(r'local\s+(\w+)', code)
+        meaningful = sum(1 for v in vars if len(v) > 2 and not v.startswith('var_') and not v.startswith('v') or len(v) > 3)
+        return int((meaningful / len(vars)) * 10) if vars else 0
+    
+    def _find_security_issues(self, code: str) -> List[Dict]:
+        issues = []
+        
+        checks = [
+            (r'loadstring\s*\(\s*[^"\']', 'Unsafe dynamic code execution', 'critical'),
+            (r'getfenv\s*\(\s*0\s*\)|setfenv', 'Environment manipulation', 'high'),
+            (r'http[s]?://\S+', 'External network request', 'medium'),
+            (r'while\s+true\s+do\s*end', 'Infinite loop (DoS)', 'medium'),
+            (r'password|api_key|secret\s*=', 'Hardcoded credentials', 'critical'),
+            (r'require\s*\(\s*["\']https?://', 'Remote code inclusion', 'critical'),
+        ]
+        
+        for pattern, description, severity in checks:
+            for match in re.finditer(pattern, code, re.IGNORECASE):
+                issues.append({
+                    'line': code[:match.start()].count('\n') + 1,
+                    'description': description,
+                    'severity': severity,
+                    'snippet': match.group(0)[:50],
+                })
+        
+        return issues
+    
+    def _extract_network_indicators(self, code: str) -> List[str]:
+        urls = re.findall(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', code)
+        domains = re.findall(r'[a-zA-Z0-9][-a-zA-Z0-9]*\.[a-zA-Z]{2,}', code)
+        ips = re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', code)
+        
+        return list(set(urls + domains + ips))
+    
+    def _extract_fs_indicators(self, code: str) -> List[str]:
+        files = re.findall(r'["\']([^"\']*\.(?:lua|txt|json|xml|dat))["\']', code, re.IGNORECASE)
+        paths = re.findall(r'["\']([^"\']*(?:/|\\)[^"\']*)["\']', code)
+        
+        return list(set(files + paths))
+    
+    def _identify_techniques(self, code: str) -> List[str]:
+        techniques = []
+        
+        technique_patterns = {
+            'base64_encoding': r'[A-Za-z0-9+/]{40,}={0,2}',
+            'hex_encoding': r'\\x[0-9A-Fa-f]{2}',
+            'xor_encryption': r'bit32\.bxor|~\s*\w+',
+            'vm_obfuscation': r'loadstring|load\s*\(',
+            'control_flow_flattening': r'while\s+true\s+do\s+if\s+not',
+            'string_concatenation': r'\.\.\s*["\']',
+            'dead_code': r'if\s+false\s+then|while\s+false\s+do',
+            'anti_debug': r'debug\.getinfo|debug\.traceback',
+            'bytecode_encoding': r'[\x00-\x08\x0b\x0c\x0e-\x1f]{10,}',
+        }
+        
+        for name, pattern in technique_patterns.items():
+            if re.search(pattern, code):
+                techniques.append(name)
+        
+        return techniques
+    
+    def _generate_recommendations(self, report: Dict) -> List[str]:
+        recommendations = []
+        
+        if report['threat_assessment']['level'] in ['high', 'critical']:
+            recommendations.append('Review all external network connections before execution')
+            recommendations.append('Run in isolated sandbox environment')
+        
+        if report['security_issues']:
+            recommendations.append('Address all critical and high severity security issues')
+        
+        if report['code_quality']['score'] < 60:
+            recommendations.append('Refactor code to improve readability and maintainability')
+        
+        if 'vm_obfuscation' in report['obfuscation_techniques']:
+            recommendations.append('Verify deobfuscated logic matches expected behavior')
+        
+        return recommendations
+    
+    def export_report(self, report: Dict, format: str = 'json') -> str:
+        if format == 'json':
+            return json.dumps(report, indent=2)
+        elif format == 'html':
+            return self._generate_html_report(report)
+        elif format == 'markdown':
+            return self._generate_markdown_report(report)
+        return ''
+    
+    def _generate_html_report(self, report: Dict) -> str:
+        html = f"""
+        <html>
+        <head><title>Shadow Analysis Report</title></head>
+        <body>
+            <h1>Code Analysis Report</h1>
+            <p>Threat Level: <span style='color:{"red" if report["threat_assessment"]["level"] == "critical" else "orange" if report["threat_assessment"]["level"] == "high" else "yellow"}'>{report["threat_assessment"]["level"].upper()}</span></p>
+            <p>Quality Score: {report["code_quality"]["score"]}/100 (Grade {report["code_quality"]["grade"]})</p>
+            <h2>Security Issues</h2>
+            <ul>
+        """
+        for issue in report['security_issues']:
+            html += f"<li>[{issue['severity'].upper()}] Line {issue['line']}: {issue['description']}</li>"
+        
+        html += "</ul></body></html>"
+        return html
+    
+    def _generate_markdown_report(self, report: Dict) -> str:
+        md = f"""# Shadow Analysis Report
+
+## Threat Assessment
+- **Level**: {report['threat_assessment']['level'].upper()}
+- **Score**: {report['threat_assessment']['score']}/{report['threat_assessment']['max_score']}
+
+## Code Quality
+- **Score**: {report['code_quality']['score']}/100
+- **Grade**: {report['code_quality']['grade']}
+
+## Security Issues
+"""
+        for issue in report['security_issues']:
+            md += f"- **[{issue['severity'].upper()}]** Line {issue['line']}: {issue['description']}\n"
+        
+        md += "\n## Recommendations\n"
+        for rec in report['recommendations']:
+            md += f"- {rec}\n"
+        
+        return md
+
+class AdvancedEncryptionBreaker:
+    def __init__(self):
+        self.common_keys = [
+            b'key', b'secret', b'password', b'admin', b'root',
+            b'123456', b'qwerty', b'letmein', b'welcome', b'password123',
+            b'lua', b'obfuscate', b'decrypt', b'encrypt', b'xor',
+            b'0x55', b'0xAA', b'0x12', b'0x34', b'0x78',
+        ]
+        self.xor_keys = [0x55, 0xAA, 0x12, 0x34, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x0F]
+        self.rc4_keys = self.common_keys
+        self.aes_keys = self.common_keys
+    
+    def decrypt_xor(self, data: bytes, key: Union[int, bytes]) -> bytes:
+        if isinstance(key, int):
+            return bytes(b ^ key for b in data)
+        return bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
+    
+    def decrypt_rc4(self, data: bytes, key: bytes) -> bytes:
+        S = list(range(256))
+        j = 0
+        out = bytearray()
+        
+        for i in range(256):
+            j = (j + S[i] + key[i % len(key)]) % 256
+            S[i], S[j] = S[j], S[i]
+        
+        i = j = 0
+        for char in data:
+            i = (i + 1) % 256
+            j = (j + S[i]) % 256
+            S[i], S[j] = S[j], S[i]
+            out.append(char ^ S[(S[i] + S[j]) % 256])
+        
+        return bytes(out)
+    
+    def decrypt_aes_ecb(self, data: bytes, key: bytes) -> bytes:
+        try:
+            from Crypto.Cipher import AES
+            cipher = AES.new(key, AES.MODE_ECB)
+            return cipher.decrypt(data)
+        except:
+            return b''
+    
+    def try_all_decryptions(self, data: bytes) -> List[Tuple[str, bytes]]:
+        results = []
+        
+        for key in self.xor_keys:
+            decrypted = self.decrypt_xor(data, key)
+            if self._is_valid_lua(decrypted):
+                results.append((f'xor_{hex(key)}', decrypted))
+        
+        for key in self.common_keys:
+            decrypted = self.decrypt_xor(data, key)
+            if self._is_valid_lua(decrypted):
+                results.append((f'xor_key_{key.decode()}', decrypted))
+            
+            if len(key) in [16, 24, 32]:
+                try:
+                    aes_decrypted = self.decrypt_aes_ecb(data, key)
+                    if self._is_valid_lua(aes_decrypted):
+                        results.append((f'aes_{key.decode()}', aes_decrypted))
+                except:
+                    pass
+        
+        for key in self.rc4_keys:
+            try:
+                rc4_decrypted = self.decrypt_rc4(data, key)
+                if self._is_valid_lua(rc4_decrypted):
+                    results.append((f'rc4_{key.decode()}', rc4_decrypted))
+            except:
+                pass
+        
+        try:
+            decompressed = zlib.decompress(data)
+            if self._is_valid_lua(decompressed):
+                results.append(('zlib', decompressed))
+        except:
+            pass
+        
+        try:
+            decompressed = zlib.decompress(data, -15)
+            if self._is_valid_lua(decompressed):
+                results.append(('zlib_raw', decompressed))
+        except:
+            pass
+        
+        try:
+            decoded = base64.b64decode(data)
+            if self._is_valid_lua(decoded):
+                results.append(('base64', decoded))
+        except:
+            pass
+        
+        return results
+    
+    def _is_valid_lua(self, data: bytes) -> bool:
+        if data.startswith(b'\x1bLua'):
+            return True
+        try:
+            text = data.decode('utf-8', errors='ignore')
+            lua_indicators = ['function', 'local', 'end', 'if', 'then', 'else', 'while', 'for', 'do', 'return']
+            score = sum(1 for ind in lua_indicators if ind in text)
+            return score >= 3 and len(text) > 50
+        except:
+            return False
+
+class StringReconstructor:
+    def __init__(self):
+        self.patterns = {
+            'char_concat': r'string\.char\s*\(([\d\s,]+)\)',
+            'byte_concat': r'string\.byte\s*\(([^)]+)\)',
+            'table_concat': r'table\.concat\s*\(\s*\{([^}]*)\}\s*\)',
+            'simple_concat': r'(["\'][^"\']*["\'])\s*\.\.\s*(["\'][^"\']*["\'])',
+            'hex_string': r'\\x([0-9A-Fa-f]{2})',
+            'unicode_escape': r'\\u([0-9A-Fa-f]{4})',
+        }
+    
+    def reconstruct_strings(self, code: str) -> str:
+        for pattern_name, pattern in self.patterns.items():
+            if pattern_name == 'char_concat':
+                for match in re.finditer(pattern, code):
+                    try:
+                        nums = [int(x.strip()) for x in match.group(1).split(',') if x.strip()]
+                        decoded = ''.join(chr(n) for n in nums if 0 <= n < 256)
+                        if all(32 <= ord(c) < 127 for c in decoded):
+                            code = code.replace(match.group(0), f'"{decoded}"', 1)
+                    except:
+                        pass
+            
+            elif pattern_name == 'hex_string':
+                hex_matches = list(re.finditer(pattern, code))
+                if hex_matches:
+                    full_hex = ''.join(m.group(1) for m in hex_matches)
+                    try:
+                        decoded = bytes.fromhex(full_hex).decode('utf-8', errors='ignore')
+                        if len(decoded) > 3:
+                            code = re.sub(r'(\\x[0-9A-Fa-f]{2})+', f'"{decoded}"', code)
+                    except:
+                        pass
+        
+        return code
+
+class JunkCodeEliminator:
+    def __init__(self):
+        self.junk_patterns = [
+            r'local\s+\w+\s*=\s*\d+\s*[\+\-]\s*\d+[^;]*',
+            r'\blocal\s+\w+\s*=\s*\w+\s*;?\s*\n',
+            r'local\s+\w+\s*=\s*\{\s*\}',
+            r'local\s+\w+\s*=\s*""',
+            r'local\s+\w+\s*=\s*0\s*;?',
+            r'if\s+true\s+then\s+else\s+end',
+            r'if\s+false\s+then\s+else\s+end',
+            r'while\s+false\s+do.*?end',
+            r'while\s+true\s+do\s*end',
+            r'assert\s*\(\s*false[^)]*\)',
+            r'error\s*\(\s*["\'][^"\']*["\']\s*\)',
+            r'debug\.getinfo\s*\([^)]*\)',
+            r'debug\.traceback\s*\([^)]*\)',
+            r'pcall\s*\(\s*function\s*\(\)\s*error\s*\([^)]*\)\s*end\s*\)',
+            r'local\s+\w+\s*=\s*function\s*\(\)\s*return\s+nil\s+end',
+            r'\(\s*function\s*\(\)[^}]*end\s*\)\s*\(\s*\)',
+            r'if\s+debug\s*then\s*return\s+end',
+            r'if\s+getfenv\s*then\s*return\s+end',
+            r'if\s+pcall\s*\(\s*function[^)]*\)\s*then\s*return\s+end',
+            r'if\s+type\(\w+\)\s*~=\s*["\']function["\']\s*then\s*return\s+end',
+            r'if\s+#\{\s*\}\s*~=\s*\d+\s*then\s*return\s+end',
+            r'if\s+\w+\s*~=\s*\w+\s*then\s*return\s+end',
+        ]
+    
+    def eliminate(self, code: str) -> str:
+        for pattern in self.junk_patterns:
+            code = re.sub(pattern, '', code, flags=re.DOTALL)
+        
+        code = self._remove_unused_vars(code)
+        code = self._remove_dead_stores(code)
+        code = self._simplify_expressions(code)
+        return code
+    
+    def _remove_unused_vars(self, code: str) -> str:
+        local_pattern = r'local\s+(\w+)'
+        locals_found = re.findall(local_pattern, code)
+        
+        for var in locals_found:
+            usages = len(re.findall(rf'\b{var}\b', code))
+            if usages <= 1:
+                code = re.sub(rf'local\s+{var}\s*=\s*[^;\n]*[;\n]?', '', code)
+        
+        return code
+    
+    def _remove_dead_stores(self, code: str) -> str:
+        pattern = r'(\w+)\s*=\s*([^;\n]+)[;\n]\s*\1\s*=\s*'
+        code = re.sub(pattern, r'\1 = ', code)
+        return code
+    
+    def _simplify_expressions(self, code: str) -> str:
+        simplifications = [
+            (r'not\s+not\s+(\w+)', r'\1'),
+                        (r'true\s+and\s+(\w+)', r'\1'),
+            (r'false\s+and\s+(\w+)', r'false'),
+            (r'true\s+or\s+(\w+)', r'true'),
+            (r'false\s+or\s+(\w+)', r'\1'),
+        ]
+        
+        for pattern, replacement in simplifications:
+            code = re.sub(pattern, replacement, code)
+        
+        return code
+
+class VMR:
+    def __init__(self):
+        self.safe_eval = SafeEvaluator()
+        self.ai = ShadowAIEngine()
+        self.opcode_mappers = {}
+        self.constant_pools = {}
+        self.register_states = {}
+        self.execution_traces = []
+        self.sandbox = ShadowSandbox()
+        self.bruteforcer = OpcodeBruteforcer()
+        self.dashboard = AnalysisDashboard()
+        self.decryption_cache = {}
+        self.string_dumper = None
+        self.encryption_breaker = AdvancedEncryptionBreaker()
+        self.string_reconstructor = StringReconstructor()
+        self.junk_eliminator = JunkCodeEliminator()
+    
+    def reconstruct(self, code: str, deep_analysis: bool = False, max_iterations: int = 10) -> str:
+        original = code
+        iteration = 0
+        
+        while iteration < max_iterations:
+            prev_code = code
+            
+            code = self._extract_vm_bytecode(code)
+            code = self._apply_opcode_bruteforce(code)
+            code = self._resolve_encrypted_constants(code)
+            code = self._break_advanced_encryption(code)
+            code = self._reconstruct_strings(code)
+            code = self._eliminate_junk(code)
+            
+            if deep_analysis:
+                code = self._dynamic_trace_analysis(code)
+                strings = self.sandbox.dump_strings()
+                if strings:
+                    self.string_dumper = strings
+            
+            code = self._trace_execution_flow(code)
+            code = self._reconstruct_control_flow(code)
+            code = self._decompile_to_lua(code)
+            code = self._optimize_with_ai(code)
+            
+            if code == prev_code:
+                break
+            
+            iteration += 1
+        
+        if deep_analysis:
+            report = self.dashboard.generate_report(original, code, {})
+            print(f"Analysis Report: {report['threat_assessment']['level']}")
+        
+        return code
+    
+    def _extract_vm_bytecode(self, code: str) -> str:
+        patterns = [
+            (r'loadstring\s*\(\s*(["\'])([A-Za-z0-9+/=]{50,})\1\s*\)', 2),
+            (r'load\s*\(\s*function\s*\(\)[^}]*return\s*(["\'])([A-Za-z0-9+/=]{50,})\1\s*end\s*\)', 2),
+            (r'local\s+\w+\s*=\s*(["\'])([A-Za-z0-9+/=]{50,})\1[^;]*;?\s*loadstring\s*\(\s*\w+\s*\)', 2),
+            (r'decode\s*\(\s*(["\'])([A-Za-z0-9+/=]{50,})\1\s*\)', 2),
+            (r'unpack\s*\(\s*(["\'])([A-Za-z0-9+/=]{50,})\1\s*\)', 2),
+            (r'buffer\s*\(\s*(["\'])([A-Za-z0-9+/=]{50,})\1\s*\)', 2),
+            (r'bytes\s*\(\s*(["\'])([A-Za-z0-9+/=]{50,})\1\s*\)', 2),
+            (r'char\s*\(\s*(["\'])([A-Za-z0-9+/=]{50,})\1\s*\)', 2),
+            (r'data\s*\(\s*(["\'])([A-Za-z0-9+/=]{50,})\1\s*\)', 2),
+            (r'chunk\s*\(\s*(["\'])([A-Za-z0-9+/=]{50,})\1\s*\)', 2),
+            (r'__lcode\s*\(\s*(["\'])([A-Za-z0-9+/=]{50,})\1\s*\)', 2),
+            (r'__ bytecode\s*\(\s*(["\'])([A-Za-z0-9+/=]{50,})\1\s*\)', 2),
+            (r'load\w*\s*\(\s*base64\.decode\s*\(\s*(["\'])([A-Za-z0-9+/=]{50,})\1\s*\)\s*\)', 2),
+            (r'load\w*\s*\(\s*decode64\s*\(\s*(["\'])([A-Za-z0-9+/=]{50,})\1\s*\)\s*\)', 2),
+            (r'load\w*\s*\(\s*crypt\.base64\.decode\s*\(\s*(["\'])([A-Za-z0-9+/=]{50,})\1\s*\)\s*\)', 2),
+        ]
+        
+        for pattern, group_idx in patterns:
+            for match in re.finditer(pattern, code):
+                encoded = match.group(group_idx)
+                cache_key = hashlib.md5(encoded.encode()).hexdigest()
+                
+                if cache_key in self.decryption_cache:
+                    lua_code = self.decryption_cache[cache_key]
+                else:
+                    try:
+                        decoded = base64.b64decode(encoded)
+                        lua_code = self._parse_bytecode_advanced(decoded)
+                        if lua_code and len(lua_code) > 50:
+                            self.decryption_cache[cache_key] = lua_code
+                    except:
+                        lua_code = None
+                
+                if lua_code:
+                    code = code.replace(match.group(0), lua_code)
+        
+        return code
+    
+    def _parse_bytecode_advanced(self, bytecode: bytes) -> str:
+        if bytecode[:4] != b'\x1bLua':
+            compressed = self._try_decompress(bytecode)
+            if compressed:
+                bytecode = compressed
+        
+        if bytecode[:4] != b'\x1bLua':
+            return ""
+        
+        try:
+            instructions, constants, prototypes = self._extract_all_advanced(bytecode)
+            
+            mappings, confidence = self.bruteforcer.bruteforce_opcodes(instructions, constants)
+            if confidence > 0.5:
+                instructions = self.bruteforcer.apply_mapping(instructions, mappings)
+            
+            folded = self._fold_constants_advanced(instructions, constants)
+            lua = self._generate_lua_advanced(folded, constants, prototypes)
+            return lua
+        except Exception as e:
+            return f"-- Parse error: {str(e)[:100]}"
+    
+    def _try_decompress(self, data: bytes) -> Optional[bytes]:
+        methods = [
+            zlib.decompress,
+            lambda x: zlib.decompress(x, -15),
+            lambda x: zlib.decompress(x, 15),
+            lambda x: zlib.decompress(x, 31),
+        ]
+        
+        for decompress in methods:
+            try:
+                result = decompress(data)
+                if b'\x1bLua' in result:
+                    return result
+            except:
+                continue
+        
+        xor_keys = [0x55, 0xAA, 0x12, 0x34, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x0F, 0x33, 0x66, 0x99, 0xCC]
+        for xor_key in xor_keys:
+            try:
+                xored = bytes(b ^ xor_key for b in data)
+                if b'\x1bLua' in xored:
+                    return xored
+            except:
+                continue
+        
+        return None
+    
+    def _extract_all_advanced(self, bytecode: bytes) -> Tuple[List[VMInstruction], List[Any], List[Any]]:
+        pos = 12
+        
+        def read_int(size: int) -> int:
+            nonlocal pos
+            val = int.from_bytes(bytecode[pos:pos+size], 'little')
+            pos += size
+            return val
+        
+        def read_size_t() -> int:
+            return read_int(4)
+        
+        def read_instruction() -> int:
+            nonlocal pos
+            val = int.from_bytes(bytecode[pos:pos+4], 'little')
+            pos += 4
+            return val
+        
+        def read_number() -> float:
+            nonlocal pos
+            return struct.unpack('<d', bytecode[pos:pos+8])[0]
+        
+        def read_string() -> str:
+            nonlocal pos
+            size = read_size_t()
+            if size == 0:
+                return ""
+            result = bytecode[pos:pos+size-1].decode('utf-8', errors='ignore')
+            pos += size
+            return result
+        
+        source_len = read_size_t()
+        pos += source_len
+        
+        line_defined = read_int(4)
+        last_line_defined = read_int(4)
+        num_upvalues = bytecode[pos]
+        pos += 1
+        num_params = bytecode[pos]
+        pos += 1
+        is_vararg = bytecode[pos]
+        pos += 1
+        max_stack_size = bytecode[pos]
+        pos += 1
+        
+        num_instr = read_int(4)
+        instructions = []
+        
+        for _ in range(num_instr):
+            instr = read_instruction()
+            opcode = instr & 0x3F
+            a = (instr >> 6) & 0xFF
+            c = (instr >> 14) & 0x1FF
+            b = (instr >> 23) & 0x1FF
+            bx = (instr >> 14) & 0x3FFFF
+            sbx = bx - 131071
+            
+            instructions.append(VMInstruction(opcode, a, b, c, bx, sbx, instr))
+        
+        num_const = read_int(4)
+        constants = []
+        
+        for _ in range(num_const):
+            const_type = bytecode[pos]
+            pos += 1
+            
+            if const_type == 0:
+                constants.append(None)
+            elif const_type == 1:
+                constants.append(bytecode[pos] != 0)
+                pos += 1
+            elif const_type == 3:
+                constants.append(read_number())
+            elif const_type == 4:
+                constants.append(read_string())
+        
+        num_protos = read_int(4)
+        prototypes = []
+        
+        for _ in range(num_protos):
+            proto_size = read_int(4)
+            if proto_size > 0:
+                proto_data = bytecode[pos:pos+proto_size]
+                prototypes.append(proto_data)
+                pos += proto_size
+        
+        return instructions, constants, prototypes
+    
+    def _apply_opcode_bruteforce(self, code: str) -> str:
+        vm_patterns = [
+            r'local\s+\w+\s*=\s*\{\s*(\d+\s*,\s*)*\d+\s*\}',
+            r'local\s+\w+\s*=\s*function\s*\([^)]*\)[^e]*end',
+            r'while\s+\w+\s*<=\s*\w+\s+do\s+local\s+\w+\s*=\s*\w+\[\w+\]',
+        ]
+        
+        for pattern in vm_patterns:
+            matches = list(re.finditer(pattern, code))
+            if len(matches) > 5:
+                code = self._attempt_vm_reconstruction(code, matches)
+        
+        return code
+    
+    def _attempt_vm_reconstruction(self, code: str, matches: List) -> str:
+        return code
+    
+    def _fold_constants_advanced(self, instructions: List[VMInstruction], constants: List[Any]) -> List[VMInstruction]:
+        regs = {}
+        optimized = []
+        
+        for instr in instructions:
+            if instr.name == 'LOADK':
+                regs[instr.a] = constants[instr.bx] if instr.bx < len(constants) else None
+                optimized.append(instr)
+            
+            elif instr.name in ['ADD', 'SUB', 'MUL', 'DIV', 'MOD', 'POW']:
+                if instr.b in regs and instr.c in regs:
+                    left, right = regs[instr.b], regs[instr.c]
+                    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+                        ops = {'ADD': operator.add, 'SUB': operator.sub, 'MUL': operator.mul, 
+                               'DIV': operator.truediv, 'MOD': operator.mod, 'POW': operator.pow}
+                        result = ops[instr.name](left, right)
+                        regs[instr.a] = result
+                        new_instr = VMInstruction(1, instr.a, 0, 0, 0, 0, instr.original)
+                        new_instr.resolved_val = result
+                        new_instr.folded = True
+                        optimized.append(new_instr)
+                        continue
+                optimized.append(instr)
+            
+            elif instr.name == 'UNM':
+                if instr.b in regs:
+                    val = regs[instr.b]
+                    if isinstance(val, (int, float)):
+                        result = -val
+                        regs[instr.a] = result
+                        new_instr = VMInstruction(1, instr.a, 0, 0, 0, 0, instr.original)
+                        new_instr.resolved_val = result
+                        new_instr.folded = True
+                        optimized.append(new_instr)
+                        continue
+                optimized.append(instr)
+            
+            elif instr.name == 'NOT':
+                if instr.b in regs:
+                    val = regs[instr.b]
+                    result = not val
+                    regs[instr.a] = result
+                    new_instr = VMInstruction(1, instr.a, 0, 0, 0, 0, instr.original)
+                    new_instr.resolved_val = result
+                    new_instr.folded = True
+                    optimized.append(new_instr)
+                    continue
+                optimized.append(instr)
+            
+            elif instr.name == 'LEN':
+                if instr.b in regs:
+                    val = regs[instr.b]
+                    if isinstance(val, (str, list, dict)):
+                        result = len(val)
+                        regs[instr.a] = result
+                        new_instr = VMInstruction(1, instr.a, 0, 0, 0, 0, instr.original)
+                        new_instr.resolved_val = result
+                        new_instr.folded = True
+                        optimized.append(new_instr)
+                        continue
+                optimized.append(instr)
+            
+            else:
+                optimized.append(instr)
+        
+        return optimized
+    
+    def _generate_lua_advanced(self, instructions: List[VMInstruction], constants: List[Any], prototypes: List[Any] = None) -> str:
+        lines = ['-- VMR Advanced Decompiled', 'local function vm_main(...)']
+        lines.append('    local R = {}')
+        lines.append('    local K = {}')
+        
+        for i, c in enumerate(constants):
+            if isinstance(c, str) and len(c) > 50:
+                lines.append(f'    K[{i}] = "{c[:50]}..."')
+            else:
+                lines.append(f'    K[{i}] = {repr(c)}')
+        
+        label_map = {}
+        for i, instr in enumerate(instructions):
+            if instr.name == 'JMP':
+                target = i + 1 + instr.sbx
+                if target not in label_map:
+                    label_map[target] = f'L{len(label_map)}'
+        
+        for i, instr in enumerate(instructions):
+            if i in label_map:
+                lines.append(f'    ::{label_map[i]}::')
+            
+            line = f'    -- [{i}] {instr.name}'
+            
+            if instr.folded and instr.resolved_val is not None:
+                line += f'\n    R[{instr.a}] = {repr(instr.resolved_val)}'
+            elif instr.name == 'LOADK':
+                line += f'\n    R[{instr.a}] = K[{instr.bx}]'
+            elif instr.name == 'LOADBOOL':
+                line += f'\n    R[{instr.a}] = {str(instr.b != 0).lower()}'
+            elif instr.name == 'LOADNIL':
+                line += f'\n    R[{instr.a}] = nil'
+            elif instr.name in ['ADD', 'SUB', 'MUL', 'DIV', 'MOD', 'POW']:
+                line += f'\n    R[{instr.a}] = R[{instr.b}] {instr.name} R[{instr.c}]'
+            elif instr.name == 'UNM':
+                line += f'\n    R[{instr.a}] = -R[{instr.b}]'
+            elif instr.name == 'NOT':
+                line += f'\n    R[{instr.a}] = not R[{instr.b}]'
+            elif instr.name == 'LEN':
+                line += f'\n    R[{instr.a}] = #R[{instr.b}]'
+            elif instr.name == 'CONCAT':
+                line += f'\n    R[{instr.a}] = R[{instr.b}] .. R[{instr.c}]'
+            elif instr.name == 'MOVE':
+                line += f'\n    R[{instr.a}] = R[{instr.b}]'
+            elif instr.name == 'GETGLOBAL':
+                c = constants[instr.bx] if instr.bx < len(constants) else 'unknown'
+                line += f'\n    R[{instr.a}] = _G["{c}"]'
+            elif instr.name == 'SETGLOBAL':
+                c = constants[instr.bx] if instr.bx < len(constants) else 'unknown'
+                line += f'\n    _G["{c}"] = R[{instr.a}]'
+            elif instr.name == 'GETTABLE':
+                line += f'\n    R[{instr.a}] = R[{instr.b}][R[{instr.c}]]'
+            elif instr.name == 'SETTABLE':
+                line += f'\n    R[{instr.a}][R[{instr.b}]] = R[{instr.c}]'
+            elif instr.name == 'NEWTABLE':
+                line += f'\n    R[{instr.a}] = {{}}'
+            elif instr.name == 'SELF':
+                line += f'\n    R[{instr.a + 1}] = R[{instr.b}]\n    R[{instr.a}] = R[{instr.b}][K[{instr.c}]]'
+            elif instr.name == 'CALL':
+                if instr.b == 0:
+                    line += f'\n    R[{instr.a}] = R[{instr.a}](unpack(R, {instr.a + 1}))'
+                elif instr.b == 1:
+                    line += f'\n    R[{instr.a}] = R[{instr.a}]()'
+                else:
+                    args = ', '.join([f'R[{instr.a + j + 1}]' for j in range(instr.b - 1)])
+                    line += f'\n    R[{instr.a}] = R[{instr.a}]({args})'
+            elif instr.name == 'RETURN':
+                if instr.b == 0:
+                    line += f'\n    return unpack(R, {instr.a})'
+                elif instr.b == 1:
+                    line += f'\n    return'
+                else:
+                    rets = ', '.join([f'R[{instr.a + j}]' for j in range(instr.b - 1)])
+                    line += f'\n    return {rets}'
+            elif instr.name == 'JMP':
+                target = i + 1 + instr.sbx
+                if target in label_map:
+                    line += f'\n    goto {label_map[target]}'
+                else:
+                    line += f'\n    goto pc_{target}'
+            elif instr.name in ['EQ', 'LT', 'LE']:
+                op = {'EQ': '==', 'LT': '<', 'LE': '<='}[instr.name]
+                line += f'\n    if R[{instr.b}] {op} R[{instr.c}] then goto L_skip end'
+            elif instr.name == 'TEST':
+                line += f'\n    if not R[{instr.a}] then goto L_skip end'
+            elif instr.name == 'TESTSET':
+                line += f'\n    if R[{instr.b}] then R[{instr.a}] = R[{instr.b}] else goto L_skip end'
+            elif instr.name == 'FORLOOP':
+                target = i + 1 + instr.sbx
+                label = label_map.get(target, f'L{target}')
+                line += f'\n    R[{instr.a}] = R[{instr.a}] + R[{instr.a + 2}]\n    if R[{instr.a}] <= R[{instr.a + 1}] then\n        R[{instr.a + 3}] = R[{instr.a}]\n        goto {label}\n    end'
+            elif instr.name == 'FORPREP':
+                target = i + 1 + instr.sbx
+                label = label_map.get(target, f'L{target}')
+                line += f'\n    R[{instr.a}] = R[{instr.a}] - R[{instr.a + 2}]\n    goto {label}'
+            elif instr.name == 'CLOSURE':
+                line += f'\n    R[{instr.a}] = function(...) return nil end'
+            elif instr.name == 'VARARG':
+                if instr.b == 0:
+                    line += f'\n    R[{instr.a}] = arg'
+                else:
+                    for j in range(instr.b - 1):
+                        line += f'\n    R[{instr.a + j}] = arg[{j + 1}]'
+            
+            lines.append(line)
+        
+        lines.append('end')
+        lines.append('return vm_main')
+        return '\n'.join(lines)
+    
+    def _dynamic_trace_analysis(self, code: str) -> str:
+        func_patterns = [
+            r'local\s+(\w+)\s*=\s*function\s*\(([^)]*)\)([^e][^n][^d].*?)end',
+            r'function\s+(\w+)\s*\(([^)]*)\)([^e][^n][^d].*?)end',
+            r'(\w+)\s*=\s*function\s*\(([^)]*)\)([^e][^n][^d].*?)end',
+        ]
+        
+        for pattern in func_patterns:
+            for match in re.finditer(pattern, code, re.DOTALL):
+                func_name = match.group(1)
+                func_body = match.group(3)
+                
+                if any(x in func_body.lower() for x in ['string.char', 'xor', 'decode', 'decrypt', 'unpack']):
+                    result = self.sandbox.simulate_call(func_body.encode(), [1, 2, 3])
+                    if result['success'] and result['trace']:
+                        resolved = self._resolve_from_trace(result['trace'])
+                        if resolved and len(str(resolved)) > 10:
+                            code = code.replace(match.group(0), f'local {func_name} = function(...) return {repr(resolved)} end', 1)
+        
+        return code
+    
+    def _resolve_from_trace(self, trace: List[Dict]) -> Optional[str]:
+        for entry in trace:
+            if 'result' in entry:
+                if isinstance(entry['result'], str) and len(entry['result']) > 5:
+                    return entry['result']
+                if isinstance(entry['result'], (int, float)):
+                    return str(entry['result'])
+        return None
+    
+    def _resolve_encrypted_constants(self, code: str) -> str:
+        xor_keys = [0x55, 0xAA, 0x12, 0x34, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x0F, 0x33, 0x66, 0x99, 0xCC, 0x11, 0x22, 0x44, 0x88, 0x77, 0xEE, 0x00, 0xFF]
+        
+        hex_pattern = r'0x([0-9A-Fa-f]{2,})'
+        for match in re.finditer(hex_pattern, code):
+            hex_str = match.group(1)
+            if len(hex_str) % 2 == 0 and len(hex_str) > 4:
+                try:
+                    decoded = bytes.fromhex(hex_str).decode('utf-8', errors='ignore')
+                    if all(32 <= ord(c) < 127 for c in decoded) and len(decoded) > 3:
+                        code = code.replace(match.group(0), f'"{decoded}"', 1)
+                except:
+                    pass
+        
+        b64_pattern = r'["\']([A-Za-z0-9+/=]{20,})["\']'
+        for match in re.finditer(b64_pattern, code):
+            encoded = match.group(1)
+            try:
+                decoded = base64.b64decode(encoded).decode('utf-8', errors='ignore')
+                if all(32 <= ord(c) < 127 for c in decoded) and len(decoded) > 5:
+                    code = code.replace(match.group(0), f'"{decoded}"', 1)
+                    continue
+            except:
+                pass
+            
+            for key in xor_keys:
+                try:
+                    xored = ''.join(chr(ord(c) ^ key) for c in encoded)
+                    if all(32 <= ord(c) < 127 for c in xored) and len(xored) > 5:
+                        code = code.replace(match.group(0), f'"{xored}"', 1)
+                        break
+                except:
+                    continue
+        
+        char_pattern = r'string\.char\s*\(([\d\s,]+)\)'
+        for match in re.finditer(char_pattern, code):
+            try:
+                nums = [int(x.strip()) for x in match.group(1).split(',') if x.strip()]
+                decoded = ''.join(chr(n) for n in nums if 0 <= n < 256)
+                if all(32 <= ord(c) < 127 for c in decoded) and len(decoded) > 3:
+                    code = code.replace(match.group(0), f'"{decoded}"', 1)
+            except:
+                pass
+        
+        return code
+    
+    def _break_advanced_encryption(self, code: str) -> str:
+        encrypted_blocks = re.findall(r'["\']([A-Za-z0-9+/=]{100,})["\']', code)
+        
+        for block in encrypted_blocks:
+            try:
+                data = base64.b64decode(block)
+                results = self.encryption_breaker.try_all_decryptions(data)
+                
+                for method, decrypted in results:
+                    if len(decrypted) > 50:
+                        try:
+                            text = decrypted.decode('utf-8', errors='ignore')
+                            code = code.replace(f'"{block}"', f'"{text}"', 1)
+                            break
+                        except:
+                            continue
+            except:
+                pass
+        
+        return code
+    
+    def _reconstruct_strings(self, code: str) -> str:
+        return self.string_reconstructor.reconstruct_strings(code)
+    
+    def _eliminate_junk(self, code: str) -> str:
+        return self.junk_eliminator.eliminate(code)
+    
+    def _trace_execution_flow(self, code: str) -> str:
+        state_machine_pattern = r'while\s+(\w+)\s*<\s*(\d+)\s*do\s+if\s+\1\s*==\s*(\d+)\s*then'
+        matches = list(re.finditer(state_machine_pattern, code))
+        
+        if len(matches) > 3:
+            blocks = []
+            var = matches[0].group(1)
+            
+            for i, match in enumerate(matches):
+                state = match.group(3)
+                end_pos = matches[i+1].start() if i+1 < len(matches) else len(code)
+                block = code[match.start():end_pos]
+                
+                block_clean = re.sub(rf'if\s+{var}\s*==\s*{state}\s+then\s*', '', block)
+                block_clean = re.sub(r'\s*end\s*$', '', block_clean)
+                block_clean = re.sub(rf'{var}\s*=\s*{int(state)+1}', '', block_clean)
+                block_clean = re.sub(rf'while\s+{var}\s*<\s*\d+\s*do', '', block_clean)
+                block_clean = re.sub(r'end\s*$', '', block_clean)
+                
+                blocks.append(block_clean.strip())
+            
+            return '\n\n'.join(blocks)
+        
+        return code
+    
+    def _reconstruct_control_flow(self, code: str) -> str:
+        patterns = [
+            (r'while\s+true\s+do\s+if\s+not\s*\((.*?)\)\s+then\s+break\s+end', r'while \1 do'),
+            (r'repeat\s+(.*?)\s+until\s+not\s*\((.*?)\)', r'while not (\2) do \1 end'),
+            (r'if\s*\((.*?)\)\s*then\s*(.*?)\s*else\s*break\s+end', r'if not (\1) then break end \2'),
+            (r'while\s+false\s+do.*?end', ''),
+            (r'if\s+true\s+then\s+else\s+end', ''),
+            (r'if\s+false\s+then\s+else\s+end', ''),
+        ]
+        
+        for pattern, replacement in patterns:
+            code = re.sub(pattern, replacement, code, flags=re.DOTALL)
+        
+        code = re.sub(r'::\w+::', '', code)
+        code = re.sub(r'goto\s+\w+', '', code)
+        
+        return code
+    
+    def _decompile_to_lua(self, code: str) -> str:
+        return code
+    
+    def _optimize_with_ai(self, code: str) -> str:
+        return self.ai.generate(code, 'vm_decode')
+
+class CodeBeautification:
+    def __init__(self):
+        self.ai = ShadowAIEngine()
+        self.indent_unit = '    '
+    
+    def beautify(self, code: str, aggressive: bool = False) -> str:
+        code = self._remove_junk(code)
+        code = self._normalize_whitespace(code)
+        code = self._restructure_blocks(code)
+        code = self._optimize_names(code)
+        code = self._smart_indent(code)
+        
+        if aggressive:
+            code = self.ai.generate(code, 'beautify')
+        
+        return code
+    
+    def _remove_junk(self, code: str) -> str:
+        junk_patterns = [
+            r'local\s+\w+\s*=\s*\d+\s*[\+\-]\s*\d+[^;]*',
+            r'\blocal\s+\w+\s*=\s*\w+\s*;?\s*\n',
+            r'local\s+\w+\s*=\s*\{\s*\}',
+            r'local\s+\w+\s*=\s*""',
+            r'local\s+\w+\s*=\s*0\s*;?',
+            r'if\s+true\s+then\s+else\s+end',
+            r'if\s+false\s+then\s+else\s+end',
+            r'while\s+false\s+do.*?end',
+            r'assert\s*\(\s*false[^)]*\)',
+            r'error\s*\(\s*["\'][^"\']*["\']\s*\)',
+            r'debug\.getinfo\s*\([^)]*\)',
+            r'debug\.traceback\s*\([^)]*\)',
+            r'pcall\s*\(\s*function\s*\(\)\s*error\s*\([^)]*\)\s*end\s*\)',
+            r'local\s+\w+\s*=\s*function\s*\(\)\s*return\s+nil\s+end',
+            r'\(\s*function\s*\(\)[^}]*end\s*\)\s*\(\s*\)',
+        ]
+        
+        for pattern in junk_patterns:
+            code = re.sub(pattern, '', code, flags=re.DOTALL)
+        
+        code = self._remove_unused_vars(code)
+        code = self._remove_dead_stores(code)
+        return code
+    
+    def _remove_unused_vars(self, code: str) -> str:
+        local_pattern = r'local\s+(\w+)'
+        locals_found = re.findall(local_pattern, code)
+        
+        for var in locals_found:
+            usages = len(re.findall(rf'\b{var}\b', code))
+            if usages <= 1:
+                code = re.sub(rf'local\s+{var}\s*=\s*[^;\n]*[;\n]?', '', code)
+        
+        return code
+    
+    def _remove_dead_stores(self, code: str) -> str:
+        pattern = r'(\w+)\s*=\s*([^;\n]+)[;\n]\s*\1\s*=\s*'
+        code = re.sub(pattern, r'\1 = ', code)
+        return code
+    
+    def _normalize_whitespace(self, code: str) -> str:
+        code = re.sub(r'[ \t]+', ' ', code)
+        code = re.sub(r';\s*', '\n', code)
+        code = re.sub(r'\r\n', '\n', code)
+        code = re.sub(r'\n{3,}', '\n\n', code)
+        return code
+    
+    def _restructure_blocks(self, code: str) -> str:
+        keywords = {
+            'function': '\nfunction ',
+            'local function': '\nlocal function ',
+            'if ': '\nif ',
+            'elseif ': '\nelseif ',
+            'else': '\nelse\n',
+            'while ': '\nwhile ',
+            'for ': '\nfor ',
+            'repeat': '\nrepeat\n',
+            'until ': '\nuntil ',
+            'return': '\nreturn ',
+        }
+        
+        for old, new in keywords.items():
+            code = code.replace(old, new)
+        
+        code = code.replace('end', '\nend\n')
+        code = re.sub(r'\n\s*\n+', '\n\n', code)
+        return code
+    
+    def _optimize_names(self, code: str) -> str:
+        common_patterns = {
+            r'local\s+(\w+)\s*=\s*game:GetService\("Players"\)': 'local Players',
+            r'local\s+(\w+)\s*=\s*game:GetService\("Workspace"\)': 'local Workspace',
+            r'local\s+(\w+)\s*=\s*game:GetService\("ReplicatedStorage"\)': 'local ReplicatedStorage',
+            r'local\s+(\w+)\s*=\s*game\.Players\.LocalPlayer': 'local LocalPlayer',
+            r'local\s+(\w+)\s*=\s*LocalPlayer\.Character': 'local Character',
+        }
+        
+        for pattern, replacement in common_patterns.items():
+            code = re.sub(pattern, replacement, code)
+        
+        return code
+    
+    def _smart_indent(self, code: str) -> str:
+        lines = code.split('\n')
+        result = []
+        indent = 0
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            if any(line.startswith(x) for x in ['end', 'until', 'else', 'elseif']):
+                indent = max(0, indent - 1)
+            
+            result.append(self.indent_unit * indent + line)
+            
+            if any(x in line for x in ['function', 'then', 'do', 'repeat', '{']) and not line.startswith('end'):
+                if 'end' not in line:
+                    indent += 1
+            
+            if line.startswith('end') or line.startswith('until'):
+                indent = max(0, indent - 1)
+        
+        return '\n'.join(result)
+
+class ShadowAntiTamper:
+    def __init__(self):
+        self.patterns = []
+    
+    def neutralize(self, code: str) -> str:
+        checks = [
+            r'if\s+debug\s*then\s*return\s+end',
+            r'if\s+getfenv\s*then\s*return\s+end',
+            r'if\s+pcall\s*\(\s*function[^)]*\)\s*then\s*return\s+end',
+            r'if\s+type\(\w+\)\s*~=\s*["\']function["\']\s*then\s*return\s+end',
+            r'if\s+#\{\s*\}\s*~=\s*\d+\s*then\s*return\s+end',
+            r'if\s+\w+\s*~=\s*\w+\s*then\s*return\s+end',
+            r'assert\s*\(\s*false[^)]*\)',
+            r'error\s*\(\s*["\'][^"\']*["\']\s*\)',
+            r'while\s+true\s+do\s*end',
+            r'for\s+\w+\s+in\s+pairs\s*\(\s*\{\s*\}\s*\)\s+do\s+end',
+            r'if\s+os\.clock\s*\(\)\s*-\s*\w+\s*>\s*\d+\s*then\s*return\s+end',
+            r'if\s+tick\s*\(\)\s*-\s*\w+\s*>\s*\d+\s*then\s*return\s+end',
+            r'if\s+debug\s*and\s+debug\.getinfo\s*then\s*error\s*\([^)]*\)\s*end',
+            r'local\s+\w+\s*=\s*getfenv\s*\(\s*\d+\s*\)[^;]*;?\s*if\s+type\s*\(\s*\w+\s*\)\s*~=\s*["\']table["\']\s*then\s*return\s+end',
+            r'setfenv\s*\(\s*\d+\s*,\s*\{\s*\}\s*\)',
+            r'getfenv\s*\(\s*\)\s*\.\s*\w+\s*=\s*nil',
+            r'debug\.sethook\s*\(\s*\w+\s*,\s*["\']c["\']\s*\)',
+            r'coroutine\.create\s*\(\s*function\s*\(\)\s*while\s+true\s+do\s*coroutine\.yield\s*\(\s*\)\s*end\s*end\s*\)',
+        ]
+        
+        for check in checks:
+            code = re.sub(check, '', code, flags=re.DOTALL)
+        
+        code = re.sub(r'getfenv\s*\(\s*(\d+)\s*\)', r'_G', code)
+        code = re.sub(r'setfenv\s*\(\s*(\d+)\s*,\s*([^)]+)\)', r'-- setfenv(\1, \2)', code)
+        code = re.sub(r'debug\.getinfo\s*\(\s*[^)]*\)', r'{}', code)
+        code = re.sub(r'debug\.traceback\s*\(\s*[^)]*\)', r'""', code)
+        code = re.sub(r'debug\.getupvalue\s*\(\s*[^)]*\)', r'nil', code)
+        code = re.sub(r'debug\.setupvalue\s*\(\s*[^)]*\)', r'nil', code)
+        code = re.sub(r'debug\.setmetatable\s*\(\s*[^)]*\)', r'nil', code)
+        code = re.sub(r'debug\.getmetatable\s*\(\s*[^)]*\)', r'nil', code)
+        code = re.sub(r'debug\.setlocal\s*\(\s*[^)]*\)', r'nil', code)
+        code = re.sub(r'debug\.getlocal\s*\(\s*[^)]*\)', r'nil', code)
+        code = re.sub(r'debug\.setconstant\s*\(\s*[^)]*\)', r'nil', code)
+        code = re.sub(r'debug\.getconstant\s*\(\s*[^)]*\)', r'nil', code)
+        
+        code = self._neutralize_environment_checks(code)
+        code = self._neutralize_timing_checks(code)
+        code = self._neutralize_debugger_detection(code)
+        code = self._neutralize_vm_detection(code)
+        
+        return code
+    
+    def _neutralize_environment_checks(self, code: str) -> str:
+        env_checks = [
+            r'if\s+_G\s*~=\s*getfenv\s*\(\s*0\s*\)\s*then\s*return\s+end',
+            r'if\s+getfenv\s*\(\s*0\s*\)\s*~=\s*_G\s*then\s*return\s+end',
+            r'if\s+_G\s*\.\s*script\s*~=\s*script\s*then\s*return\s+end',
+            r'if\s+script\s*\.\s*Parent\s*~=\s*\w+\s*then\s*return\s+end',
+            r'if\s+game\s*\.\s*PlaceId\s*~=\s*\d+\s*then\s*return\s+end',
+            r'if\s+game\s*\.\s*GameId\s*~=\s*\d+\s*then\s*return\s+end',
+        ]
+        
+        for check in env_checks:
+            code = re.sub(check, '', code, flags=re.DOTALL)
+        
+        return code
+    
+    def _neutralize_timing_checks(self, code: str) -> str:
+        timing_patterns = [
+            r'local\s+(\w+)\s*=\s*os\.clock\s*\(\s*\)[^;]*;?\s*if\s+os\.clock\s*\(\s*\)\s*-\s*\1\s*>\s*\d+\s*then\s*return\s+end',
+            r'local\s+(\w+)\s*=\s*tick\s*\(\s*\)[^;]*;?\s*if\s+tick\s*\(\s*\)\s*-\s*\1\s*>\s*\d+\s*then\s*return\s+end',
+            r'local\s+(\w+)\s*=\s*time\s*\(\s*\)[^;]*;?\s*if\s+time\s*\(\s*\)\s*-\s*\1\s*>\s*\d+\s*then\s*return\s+end',
+        ]
+        
+        for pattern in timing_patterns:
+            code = re.sub(pattern, '', code, flags=re.DOTALL)
+        
+        return code
+    
+    def _neutralize_debugger_detection(self, code: str) -> str:
+        debugger_patterns = [
+            r'if\s+debug\s*\.\s*gethook\s*\(\s*\)\s*then\s*return\s+end',
+            r'if\s+debug\s*\.\s*getmetatable\s*\(\s*debug\s*\)\s*then\s*return\s+end',
+            r'local\s+\w+\s*=\s*debug\s*\.\s*getinfo\s*\(\s*1\s*\)[^;]*;?\s*if\s+\w+\s*\.\s*source\s*~=\s*["\'][^"\']*["\']\s*then\s*return\s+end',
+            r'if\s+#\s*debug\s*\.\s*getregistry\s*\(\s*\)\s*>\s*\d+\s*then\s*return\s+end',
+        ]
+        
+        for pattern in debugger_patterns:
+            code = re.sub(pattern, '', code, flags=re.DOTALL)
+        
+        return code
+    
+    def _neutralize_vm_detection(self, code: str) -> str:
+        vm_patterns = [
+            r'if\s+type\s*\(\s*loadstring\s*\)\s*~=\s*["\']function["\']\s*then\s*return\s+end',
+            r'if\s+not\s*loadstring\s*then\s*return\s+end',
+            r'if\s+not\s*getfenv\s*then\s*return\s+end',
+            r'if\s+not\s*setfenv\s*then\s*return\s+end',
+            r'if\s+not\s*debug\s*then\s*return\s+end',
+            r'if\s+not\s*pcall\s*then\s*return\s+end',
+            r'if\s+not\s*xpcall\s*then\s*return\s+end',
+            r'if\s+jit\s*then\s*return\s+end',
+            r'if\s+not\s*jit\s*then\s*return\s+end',
+        ]
+        
+        for pattern in vm_patterns:
+            code = re.sub(pattern, '', code, flags=re.DOTALL)
+        
+        return code
+
+class ShadowCryptography:
+    def __init__(self):
+        self.common_keys = [
+            b'key', b'secret', b'password', b'admin', b'root',
+            b'123456', b'qwerty', b'letmein', b'welcome', b'password123',
+            b'lua', b'obfuscate', b'decrypt', b'encrypt', b'xor',
+            b'0x55', b'0xAA', b'0x12', b'0x34', b'0x78',
+        ]
+        self.xor_keys = [0x55, 0xAA, 0x12, 0x34, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x0F]
+    
+    def decrypt_xor(self, data: bytes, key: Union[int, bytes]) -> bytes:
+        if isinstance(key, int):
+            return bytes(b ^ key for b in data)
+        return bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
+    
+    def try_decrypt(self, data: bytes) -> List[Tuple[str, bytes]]:
+        results = []
+        
+        for key in self.xor_keys:
+            decrypted = self.decrypt_xor(data, key)
+            if self._is_valid_lua(decrypted):
+                results.append((f'xor_{hex(key)}', decrypted))
+        
+        for key in self.common_keys:
+            decrypted = self.decrypt_xor(data, key)
+            if self._is_valid_lua(decrypted):
+                results.append((f'xor_key_{key.decode()}', decrypted))
+        
+        try:
+            decompressed = zlib.decompress(data)
+            if self._is_valid_lua(decompressed):
+                results.append(('zlib', decompressed))
+        except:
+            pass
+        
+        try:
+            decompressed = zlib.decompress(data, -15)
+            if self._is_valid_lua(decompressed):
+                results.append(('zlib_raw', decompressed))
+        except:
+            pass
+        
+        try:
+            decoded = base64.b64decode(data)
+            if self._is_valid_lua(decoded):
+                results.append(('base64', decoded))
+        except:
+            pass
+        
+        return results
+    
+    def _is_valid_lua(self, data: bytes) -> bool:
+        if data.startswith(b'\x1bLua'):
+            return True
+        try:
+            text = data.decode('utf-8', errors='ignore')
+            lua_indicators = ['function', 'local', 'end', 'if', 'then', 'else', 'while', 'for', 'do', 'return']
+            score = sum(1 for ind in lua_indicators if ind in text)
+            return score >= 3 and len(text) > 50
+        except:
+            return False
+    
+    def extract_strings(self, data: bytes) -> List[str]:
+        strings = []
+        current = b''
+        
+        for byte in data:
+            if 32 <= byte < 127:
+                current += bytes([byte])
+            else:
+                if len(current) >= 4:
+                    strings.append(current.decode('utf-8', errors='ignore'))
+                current = b''
+        
+        if len(current) >= 4:
+            strings.append(current.decode('utf-8', errors='ignore'))
+        
+        return strings
+
+class ShadowHeuristicEngine:
+    def __init__(self):
+        self.ai = ShadowAIEngine()
+        self.patterns = {
+            'string_concat': r'(["\'][^"\']*["\'])\s*\.\.\s*(["\'][^"\']*["\'])',
+            'table_concat': r'table\.concat\s*\(\s*\{([^}]*)\}\s*,\s*["\']?[^"\')]*["\']?\)',
+            'string_char': r'string\.char\s*\(([^)]+)\)',
+            'string_byte': r'string\.byte\s*\(([^)]+)\)',
+            'bit_xor': r'bit32\.bxor\s*\(([^)]+)\)',
+            'bit_and': r'bit32\.band\s*\(([^)]+)\)',
+            'bit_or': r'bit32\.bor\s*\(([^)]+)\)',
+            'bit_not': r'bit32\.bnot\s*\(([^)]+)\)',
+        }
+    
+    def analyze(self, code: str) -> Dict[str, Any]:
+        results = {
+            'entropy': self._calculate_entropy(code),
+            'patterns_found': {},
+            'suspicious_constructs': [],
+            'complexity_score': 0,
+        }
+        
+        for name, pattern in self.patterns.items():
+            matches = list(re.finditer(pattern, code))
+            if matches:
+                results['patterns_found'][name] = len(matches)
+        
+        suspicious = [
+            (r'loadstring\s*\(\s*function', 'dynamic_code_loading'),
+            (r'getfenv\s*\(\s*0\s*\)', 'environment_manipulation'),
+            (r'setfenv\s*\(\s*1', 'environment_manipulation'),
+            (r'debug\.getinfo', 'debug_api_usage'),
+            (r'debug\.getupvalue', 'debug_api_usage'),
+            (r'debug\.setupvalue', 'debug_api_usage'),
+            (r'while\s+true\s+do\s*end', 'infinite_loop'),
+            (r'for\s+\w+\s+in\s+pairs\s*\(\s*\{\s*\}\s*\)\s+do\s+end', 'empty_loop'),
+            (r'pcall\s*\(\s*error', 'error_obfuscation'),
+            (r'string\.dump\s*\(\s*\w+\s*\)', 'bytecode_extraction'),
+            (r'collectgarbage\s*\(\s*["\']count["\']', 'memory_tracking'),
+        ]
+        
+        for pattern, desc in suspicious:
+            if re.search(pattern, code):
+                results['suspicious_constructs'].append(desc)
+        
+        results['complexity_score'] = self._calculate_complexity(code)
+        
+        return results
+    
+    def _calculate_entropy(self, data: str) -> float:
+        if not data:
+            return 0.0
+        
+        entropy = 0.0
+        for x in range(256):
+            p_x = float(data.count(chr(x))) / len(data)
+            if p_x > 0:
+                entropy += - p_x * math.log(p_x, 2)
+        
+        return entropy
+    
+    def _calculate_complexity(self, code: str) -> int:
+        score = 0
+        score += len(re.findall(r'if|then|else|elseif', code)) * 2
+        score += len(re.findall(r'while|for|repeat|until', code)) * 3
+        score += len(re.findall(r'function|local function', code)) * 5
+        score += len(re.findall(r'pcall|xpcall|loadstring', code)) * 10
+        score += len(re.findall(r'getfenv|setfenv|debug\.', code)) * 15
+        return score
+
+class ShadowDeobfuscator:
+    def __init__(self):
+        self.ast_transformer = ASTTransformer()
+        self.control_flow = ControlFlowAnalyzer()
+        self.vmr = VMR()
+        self.beautifier = CodeBeautification()
+        self.anti_tamper = ShadowAntiTamper()
+        self.crypto = ShadowCryptography()
+        self.heuristic = ShadowHeuristicEngine()
+        self.ai = ShadowAIEngine()
+    
+    def deobfuscate(self, code: str, aggressive: bool = False, deep_analysis: bool = False) -> Dict[str, Any]:
+        original = code
+        steps = []
+        
+        code = self.anti_tamper.neutralize(code)
+        steps.append('neutralized_anti_tamper')
+        
+        code = self.ast_transformer.transform(code)
+        steps.append('ast_transformation')
+        
+        code = self.control_flow.analyze(code)
+        steps.append('control_flow_analysis')
+        
+        crypto_results = self.crypto.try_decrypt(code.encode())
+        if crypto_results:
+            code = crypto_results[0][1].decode('utf-8', errors='ignore')
+            steps.append(f'decrypted_{crypto_results[0][0]}')
+        
+        code = self.vmr.reconstruct(code, deep_analysis)
+        steps.append('vm_reconstruction')
+        
+        heuristic_analysis = self.heuristic.analyze(code)
+        steps.append('heuristic_analysis')
+        
+        code = self.beautifier.beautify(code, aggressive)
+        steps.append('beautification')
+        
+        if aggressive:
+            code = self.ai.multi_pass(code, passes=3, mode='deobfuscate')
+            steps.append('ai_optimization')
+        
+        final_analysis = self.heuristic.analyze(code)
+        
+        return {
+            'original': original,
+            'deobfuscated': code,
+            'steps': steps,
+            'heuristic_before': heuristic_analysis,
+            'heuristic_after': final_analysis,
+            'entropy_reduction': heuristic_analysis['entropy'] - final_analysis['entropy'],
+            'complexity_reduction': heuristic_analysis['complexity_score'] - final_analysis['complexity_score'],
+        }
+
+class ShadowBatchProcessor:
+    def __init__(self):
+        self.deobfuscator = ShadowDeobfuscator()
+        self.results = []
+    
+    def process_file(self, filepath: str, aggressive: bool = False) -> Dict[str, Any]:
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            code = f.read()
+        
+        result = self.deobfuscator.deobfuscate(code, aggressive)
+        result['filepath'] = filepath
+        self.results.append(result)
+        return result
+    
+    def process_directory(self, directory: str, pattern: str = '*.lua', aggressive: bool = False) -> List[Dict[str, Any]]:
+        import glob
+        files = glob.glob(os.path.join(directory, pattern))
+        
+        for filepath in files:
+            try:
+                self.process_file(filepath, aggressive)
+            except Exception as e:
+                self.results.append({
+                    'filepath': filepath,
+                    'error': str(e),
+                })
+        
+        return self.results
+    
+    def export_results(self, output_dir: str, format: str = 'json'):
+        os.makedirs(output_dir, exist_ok=True)
+        
+        for i, result in enumerate(self.results):
+            if 'error' in result:
+                continue
+            
+            base_name = os.path.basename(result['filepath'])
+            name, _ = os.path.splitext(base_name)
+            
+            output_path = os.path.join(output_dir, f'{name}_clean.lua')
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(result['deobfuscated'])
+            
+            if format == 'json':
+                report_path = os.path.join(output_dir, f'{name}_report.json')
+                with open(report_path, 'w', encoding='utf-8') as f:
+                    json.dump({
+                        'steps': result['steps'],
+                        'heuristic_before': result['heuristic_before'],
+                        'heuristic_after': result['heuristic_after'],
+                        'entropy_reduction': result['entropy_reduction'],
+                        'complexity_reduction': result['complexity_reduction'],
+                    }, f, indent=2)
+
+def main():
+    deobfuscator = ShadowDeobfuscator()
+    
+    sample_code = '''
+    local _0x1a2b = "SGVsbG8gV29ybGQ="
+    local _0x3c4d = loadstring
+    local _0x5e6f = _0x3c4d(game:HttpGet("https://example.com/script.lua"))
+    _0x5e6f()
+    '''
+    
+    result = deobfuscator.deobfuscate(sample_code, aggressive=True, deep_analysis=True)
+    
+    print("Steps performed:", result['steps'])
+    print("\nDeobfuscated code:")
+    print(result['deobfuscated'])
+    print(f"\nEntropy reduction: {result['entropy_reduction']:.2f}")
+    print(f"Complexity reduction: {result['complexity_reduction']}")
+
+if __name__ == '__main__':
+    main()
+# BY SHADOW
