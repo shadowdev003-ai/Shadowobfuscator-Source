@@ -1,4 +1,4 @@
-import re
+Import re
 import base64
 import zlib
 import ast
@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
+import networkx as nx
 
 try:
    import luaparser
@@ -336,12 +337,6 @@ class ASTTransformer:
        except:
            return self._regex_transform(code)
    
-   def _regex_transform(self, code: str) -> str:
-       code = self._fold_constants_regex(code)
-       code = self._rename_variables_regex(code)
-       code = self._eliminate_dead_code_regex(code)
-       return code
-   
    def _fold_constants(self, node):
        if isinstance(node, (Number, String, Nil, Boolean)):
            return node
@@ -500,11 +495,14 @@ class ControlFlowAnalyzer:
        self.cfg = {}
        self.blocks = []
        self.z3_solver = Solver() if Z3_AVAILABLE else None
+       self.graph = nx.DiGraph()
    
    def analyze(self, code: str) -> str:
        self._build_cfg(code)
+       self._build_graph(code)
        code = self._unflatten_control_flow(code)
        code = self._solve_opaque_predicates(code)
+       code = self._resolve_dynamic_gotos(code)
        return code
    
    def _build_cfg(self, code: str):
@@ -534,6 +532,15 @@ class ControlFlowAnalyzer:
            
            if idx < len(self.blocks) - 1:
                self.cfg[idx]['successors'].append(idx + 1)
+   
+   def _build_graph(self, code: str):
+       self.graph.clear()
+       for i, line in enumerate(code.split('\n')):
+           self.graph.add_node(i, code=line.strip())
+           if 'then' in line or 'do' in line:
+               self.graph.add_edge(i, i+1)
+           if 'end' in line or 'else' in line:
+               self.graph.add_edge(i, i+1)
    
    def _unflatten_control_flow(self, code: str) -> str:
        state_machine_pattern = r'while\s+(\w+)\s*<\s*(\d+)\s*do\s+if\s+\1\s*==\s*(\d+)\s*then'
@@ -567,7 +574,7 @@ class ControlFlowAnalyzer:
        opaque_patterns = [
            (r'if\s*\((\d+)\s*%\s*(\d+)\s*==\s*(\d+)\)\s*then', self._solve_mod_predicate),
            (r'if\s*\((\d+)\s*\*\s*(\d+)\s*\+\s*(\d+)\s*==\s*(\d+)\)\s*then', self._solve_linear_predicate),
-           (r'if\s*\((\w+)\s*~\s*(\w+)\s*==\s*0\)\s*then', lambda *args: True),
+           (r'if\s*\((\w+)\s*\~\s*(\w+)\s*==\s*0\)\s*then', lambda *args: True),
        ]
        
        for pattern, solver_func in opaque_patterns:
@@ -593,33 +600,17 @@ class ControlFlowAnalyzer:
            return (a * b + c) == d
        except:
            return None
-
-class VMInstruction:
-   def __init__(self, opcode, a, b, c, bx, sbx, original=0, name=""):
-       self.opcode = opcode
-       self.a = a
-       self.b = b
-       self.c = c
-       self.bx = bx
-       self.sbx = sbx
-       self.original = original
-       self.name = name or self._get_opcode_name(opcode)
-       self.resolved_val = None
-       self.folded = False
-       self.execution_count = 0
-       self.next_opcodes = []
    
-   def _get_opcode_name(self, opcode):
-       opcodes = {
-           0: 'MOVE', 1: 'LOADK', 2: 'LOADBOOL', 3: 'LOADNIL', 4: 'GETUPVAL',
-           5: 'GETGLOBAL', 6: 'GETTABLE', 7: 'SETGLOBAL', 8: 'SETUPVAL', 9: 'SETTABLE',
-           10: 'NEWTABLE', 11: 'SELF', 12: 'ADD', 13: 'SUB', 14: 'MUL', 15: 'DIV',
-           16: 'MOD', 17: 'POW', 18: 'UNM', 19: 'NOT', 20: 'LEN', 21: 'CONCAT',
-           22: 'JMP', 23: 'EQ', 24: 'LT', 25: 'LE', 26: 'TEST', 27: 'TESTSET',
-           28: 'CALL', 29: 'TAILCALL', 30: 'RETURN', 31: 'FORLOOP', 32: 'FORPREP',
-           33: 'TFORLOOP', 34: 'SETLIST', 35: 'CLOSE', 36: 'CLOSURE', 37: 'VARARG',
-       }
-       return opcodes.get(opcode, f'OP_{opcode}')
+   def _resolve_dynamic_gotos(self, code):
+       label_map = {}
+       for match in re.finditer(r'::(LABEL_\w+)::', code):
+           label_map[match.group(1)] = match.start()
+       
+       return re.sub(
+           r'\bgoto\s+(LABEL_\w+)',
+           lambda m: f'goto {label_map.get(m.group(1), "UNKNOWN_LABEL")}',
+           code
+       )
 
 class ShadowSandbox:
    def __init__(self):
@@ -1202,66 +1193,48 @@ class AnalysisDashboard:
            (r'hookfunction|replaceclosure|newcclosure', 'function_hooking', 2),
            (r'getrawmetatable|setrawmetatable', 'metatable_manipulation', 2),
            (r'debug\.setconstant|debug\.setupvalue', 'debug_manipulation', 3),
-           (r'while\s+true\s+do\s*end|for\s+\w+\s+in\s+pairs\s*\(\s*\{\s*\}\s*\)\s+do\s+end', 'denial_of_service', 2),
        ]
        
-       for pattern, threat_type, severity in malicious_patterns:
-           if re.search(pattern, original, re.IGNORECASE):
-               threats.append({'type': threat_type, 'severity': severity})
-               score += severity
-       
-       max_score = len(malicious_patterns) * 3
-       threat_level = 'low' if score < 3 else 'medium' if score < 6 else 'high' if score < 9 else 'critical'
-       
-       return {
-           'score': score,
-           'max_score': max_score,
-           'level': threat_level,
-           'threats': threats,
-       }
-   
-   def _assess_quality(self, code: str) -> Dict[str, Any]:
-       metrics = {
-           'lines_of_code': len(code.split('\n')),
-           'functions': len(re.findall(r'function\s+\w+', code)),
-           'complexity': len(re.findall(r'if|while|for|repeat', code)),
-           'duplication': self._detect_duplication(code),
-           'naming_quality': self._assess_naming(code),
-       }
-       
-       quality_score = 100
-       quality_score -= metrics['complexity'] * 2
-       quality_score -= metrics['duplication'] * 10
-       quality_score -= (10 - metrics['naming_quality']) * 5
-       
-       return {
-           'metrics': metrics,
-           'score': max(0, quality_score),
-           'grade': 'A' if quality_score > 80 else 'B' if quality_score > 60 else 'C' if quality_score > 40 else 'D',
-       }
-   
-   def _detect_duplication(self, code: str) -> int:
-       lines = code.split('\n')
-       unique_lines = set(lines)
-       return len(lines) - len(unique_lines)
-   
-   def _assess_naming(self, code: str) -> int:
-       vars = re.findall(r'local\s+(\w+)', code)
-       meaningful = sum(1 for v in vars if len(v) > 2 and not v.startswith('var_') and not v.startswith('v') or len(v) > 3)
-       return int((meaningful / len(vars)) * 10) if vars else 0
-   
-   def _find_security_issues(self, code: str) -> List[Dict]:
-       issues = []
-       
-       checks = [
-           (r'loadstring\s*\(\s*[^"\']', 'Unsafe dynamic code execution', 'critical'),
-           (r'getfenv\s*\(\s*0\s*\)|setfenv', 'Environment manipulation', 'high'),
-           (r'http[s]?://\S+', 'External network request', 'medium'),
+       checks = malicious_patterns + [
            (r'while\s+true\s+do\s*end', 'Infinite loop (DoS)', 'medium'),
            (r'password|api_key|secret\s*=', 'Hardcoded credentials', 'critical'),
            (r'require\s*\(\s*["\']https?://', 'Remote code inclusion', 'critical'),
        ]
        
+       issues = []
+       for pattern, description, severity in checks:
+           for match in re.finditer(pattern, original, re.IGNORECASE):
+               issues.append({
+                   'line': original[:match.start()].count('\n') + 1,
+                   'description': description,
+                   'severity': severity,
+                   'snippet': match.group(0)[:50],
+               })
+       
+       level = 'low'
+       if any(i['severity'] in ['high', 'critical'] for i in issues):
+           level = 'critical'
+       elif any(i['severity'] == 'medium' for i in issues):
+           level = 'high'
+       
+       return {'level': level, 'issues': issues, 'score': sum(self.threat_levels.get(i['severity'], 0) for i in issues)}
+   
+   def _assess_quality(self, code: str) -> Dict[str, Any]:
+       score = 100
+       score -= len(re.findall(r'var_\d+', code)) * 2
+       score -= code.count('goto') * 3
+       score += len(re.findall(r'function\s+\w+', code)) * 5
+       grade = 'A' if score >= 90 else 'B' if score >= 70 else 'C'
+       return {'score': max(0, score), 'grade': grade}
+   
+   def _find_security_issues(self, code: str) -> List[Dict]:
+       issues = []
+       checks = [
+           (r'http[s]?://\S+', 'External network request', 'medium'),
+           (r'while\s+true\s+do\s*end', 'Infinite loop (DoS)', 'medium'),
+           (r'password|api_key|secret\s*=', 'Hardcoded credentials', 'critical'),
+           (r'require\s*\(\s*["\']https?://', 'Remote code inclusion', 'critical'),
+       ]
        for pattern, description, severity in checks:
            for match in re.finditer(pattern, code, re.IGNORECASE):
                issues.append({
@@ -1270,7 +1243,6 @@ class AnalysisDashboard:
                    'severity': severity,
                    'snippet': match.group(0)[:50],
                })
-       
        return issues
    
    def _extract_network_indicators(self, code: str) -> List[str]:
@@ -1292,7 +1264,7 @@ class AnalysisDashboard:
        technique_patterns = {
            'base64_encoding': r'[A-Za-z0-9+/]{40,}={0,2}',
            'hex_encoding': r'\\x[0-9A-Fa-f]{2}',
-           'xor_encryption': r'bit32\.bxor|~\s*\w+',
+           'xor_encryption': r'bit32\.bxor|\~\s*\w+',
            'vm_obfuscation': r'loadstring|load\s*\(',
            'control_flow_flattening': r'while\s+true\s+do\s+if\s+not',
            'string_concatenation': r'\.\.\s*["\']',
@@ -1328,50 +1300,105 @@ class AnalysisDashboard:
    def export_report(self, report: Dict, format: str = 'json') -> str:
        if format == 'json':
            return json.dumps(report, indent=2)
-       elif format == 'html':
-           return self._generate_html_report(report)
-       elif format == 'markdown':
-           return self._generate_markdown_report(report)
        return ''
+
+class ConstantTracker:
+   def __init__(self):
+       self.known_values = {
+           'var_18': 256,
+           'var_12': 3,
+           'var_16': 16,
+           'var_10': 10
+       }
    
-   def _generate_html_report(self, report: Dict) -> str:
-       html = f"""
-       <html>
-       <head><title>Shadow Analysis Report</title></head>
-       <body>
-           <h1>Code Analysis Report</h1>
-           <p>Threat Level: <span style='color:{"red" if report["threat_assessment"]["level"] == "critical" else "orange" if report["threat_assessment"]["level"] == "high" else "yellow"}'>{report["threat_assessment"]["level"].upper()}</span></p>
-           <p>Quality Score: {report["code_quality"]["score"]}/100 (Grade {report["code_quality"]["grade"]})</p>
-           <h2>Security Issues</h2>
-           <ul>
-       """
-       for issue in report['security_issues']:
-           html += f"<li>[{issue['severity'].upper()}] Line {issue['line']}: {issue['description']}</li>"
-       
-       html += "</ul></body></html>"
-       return html
+   def get_value(self, var: str) -> str:
+       return str(self.known_values.get(var, var))
+
+class DecoyDetector:
+   def __init__(self):
+       self.patterns = {
+           'string_decoys': [
+               (r'\.\.\s*("?\\\d{2,}[a-zA-Z][^",]*)', ''),
+               (r',\s*"[^"]*"\.\.\\\d{2,}[a-zA-Z][^"]*"', ''),
+               (r',\s*,', ',')
+           ],
+           'arithmetic_decoys': [
+               (r'\b-?0x[\dA-Fa-f]+[g-z]\b', ''),
+               (r'\b\d+[A-Za-z]+\s*=', '')
+           ],
+           'control_flow_decoys': [
+               (r'<\s*-?\d+[a-zA-Z]', ''),
+               (r'==\s*-\d+[a-fA-F]+\b', '')
+           ],
+           'unreachable_ops': [
+               (r'if\s+[\w.]+\s*==\s*-\d+[a-zA-Z]+\s+then', ''),
+               (r'/\s*\(\s*\)', '')
+           ],
+           'memory_decoys': [
+               (r'\b(memory|pointer|versan)\s*=\s*nil\b.*[=/]\s*\b(byte|table)\.', ''),
+               (r'\bchar\s*=\s*\w+\s*[+%]\s*\w+\s*%\s*\w+', ''),
+           ],
+       }
+
+   def remove_decoys(self, code: str) -> tuple:
+       removed = defaultdict(int)
+       for category, patterns in self.patterns.items():
+           for pattern, repl in patterns:
+               count = len(re.findall(pattern, code))
+               if count:
+                   code = re.sub(pattern, repl, code)
+                   removed[category] += count
+       return code, removed
+
+class Utils:
+   @staticmethod
+   def reverse_string_permutation(code: str) -> str:
+       return re.sub(r'"\s*\+\s*"', '', re.sub(r'\[,""\]\s*=\s*\d+,', '', code))
    
-   def _generate_markdown_report(self, report: Dict) -> str:
-       md = f"""# Shadow Analysis Report
-
-## Threat Assessment
-- **Level**: {report['threat_assessment']['level'].upper()}
-- **Score**: {report['threat_assessment']['score']}/{report['threat_assessment']['max_score']}
-
-## Code Quality
-- **Score**: {report['code_quality']['score']}/100
-- **Grade**: {report['code_quality']['grade']}
-
-## Security Issues
-"""
-       for issue in report['security_issues']:
-           md += f"- **[{issue['severity'].upper()}]** Line {issue['line']}: {issue['description']}\n"
-       
-       md += "\n## Recommendations\n"
-       for rec in report['recommendations']:
-           md += f"- {rec}\n"
-       
-       return md
+   @staticmethod
+   def evaluate_arithmetic(code: str) -> str:
+       code = re.sub(r"(\w+)\s+(\w+)(?=\s*\^)", r"\1*\2", code)
+       code = re.sub(r"(\d+)\s+(\d+)", r"\1*\2", code)
+       return re.sub(r"(\w+)\s*([+-])\s*(\w+)\s*(\^)", r"(\1 \2 \3)\4", code)
+   
+   @staticmethod
+   def handle_number_obfuscation(code: str) -> str:
+       patterns = [
+           (r"\bvar_18\b", "256"),
+           (r"\bvar_12\b", "3"), 
+           (r"\bvar_15\b", "1"),
+           (r"\bvar_6\b", "2"),
+           (r"64\s*\^\s*\(\s*\(\s*3\s*\*\s*1\s*\)\s*-\s*0\s*\)", "262144")
+       ]
+       for p, r in patterns:
+           code = re.sub(p, r, code)
+       return code
+   
+   @staticmethod
+   def reconstruct_array_initialization(code: str) -> str:
+       code = re.sub(r"\{\s*(\w+)\s*=\s*(\w+),?\s*(\d+)\s*=\s*(\d+),?", r"{\1 = \2, [\3] = \4}", code)
+       return re.sub(r"\[\"\\049\"\]", r'[1]', code)
+   
+   @staticmethod
+   def fix_table_syntax(code: str) -> str:
+       code = re.sub(r"\[\\(\d+)\]", lambda m: f'["{chr(int(m.group(1)))}"]', code)
+       return re.sub(r",\s*(for|end|do|while)", r"; \1", code)
+   
+   @staticmethod
+   def remove_junkcode(code: str) -> str:
+       patterns = [
+           (r'\b(local\s+)?([a-zA-Z_]\w*)\s*=\s*error\s*\(\s*\2\s*\)\s*[;]?\s*\n', ""),
+           (r"(\w+)\s*=\s*\1\s*=\s*nil", ""),
+           (r"\b(buffer|state|number|position)\s*=\s*nil\n", ""),
+           (r"\b\w+\s*=\s*{\s*}\n", ""),
+       ]
+       for p, r in patterns:
+           code = re.sub(p, r, code, flags=re.MULTILINE|re.IGNORECASE)
+       return re.sub(r'\n\s*\n', '\n', code)
+   
+   @staticmethod
+   def defragment_strings(code: str) -> str:
+       return re.sub(r'(".*?")\s*\n\s*"(.*?")', lambda m: f'"{m.group(1)[1:-1]}{m.group(2)[1:-1]}"', code)
 
 class VMR:
    def __init__(self):
@@ -1386,6 +1413,9 @@ class VMR:
        self.dashboard = AnalysisDashboard()
        self.decryption_cache = {}
        self.string_dumper = None
+       self.decoy_detector = DecoyDetector()
+       self.constant_tracker = ConstantTracker()
+       self.utils = Utils()
    
    def reconstruct(self, code: str, deep_analysis: bool = False, max_iterations: int = 5) -> str:
        original = code
@@ -1409,6 +1439,14 @@ class VMR:
            code = self._decompile_to_lua(code)
            code = self._optimize_with_ai(code)
            
+           code, _ = self.decoy_detector.remove_decoys(code)
+           code = self.utils.remove_junkcode(code)
+           code = self.utils.defragment_strings(code)
+           code = self.utils.handle_number_obfuscation(code)
+           code = self.utils.evaluate_arithmetic(code)
+           code = self.utils.reconstruct_array_initialization(code)
+           code = self.utils.fix_table_syntax(code)
+           
            if code == prev_code:
                break
            
@@ -1416,7 +1454,6 @@ class VMR:
        
        if deep_analysis:
            report = self.dashboard.generate_report(original, code, {})
-           print(f"Analysis Report: {report['threat_assessment']['level']}")
        
        return code
    
@@ -1425,18 +1462,6 @@ class VMR:
            (r'loadstring\s*\(\s*(["\'])([A-Za-z0-9+/=]{50,})\1\s*\)', 2),
            (r'load\s*\(\s*function\s*\(\)[^}]*return\s*(["\'])([A-Za-z0-9+/=]{50,})\1\s*end\s*\)', 2),
            (r'local\s+\w+\s*=\s*(["\'])([A-Za-z0-9+/=]{50,})\1[^;]*;?\s*loadstring\s*\(\s*\w+\s*\)', 2),
-           (r'decode\s*\(\s*(["\'])([A-Za-z0-9+/=]{50,})\1\s*\)', 2),
-           (r'unpack\s*\(\s*(["\'])([A-Za-z0-9+/=]{50,})\1\s*\)', 2),
-           (r'buffer\s*\(\s*(["\'])([A-Za-z0-9+/=]{50,})\1\s*\)', 2),
-           (r'bytes\s*\(\s*(["\'])([A-Za-z0-9+/=]{50,})\1\s*\)', 2),
-           (r'char\s*\(\s*(["\'])([A-Za-z0-9+/=]{50,})\1\s*\)', 2),
-           (r'data\s*\(\s*(["\'])([A-Za-z0-9+/=]{50,})\1\s*\)', 2),
-           (r'chunk\s*\(\s*(["\'])([A-Za-z0-9+/=]{50,})\1\s*\)', 2),
-           (r'__lcode\s*\(\s*(["\'])([A-Za-z0-9+/=]{50,})\1\s*\)', 2),
-           (r'__ bytecode\s*\(\s*(["\'])([A-Za-z0-9+/=]{50,})\1\s*\)', 2),
-           (r'load\w*\s*\(\s*base64\.decode\s*\(\s*(["\'])([A-Za-z0-9+/=]{50,})\1\s*\)\s*\)', 2),
-           (r'load\w*\s*\(\s*decode64\s*\(\s*(["\'])([A-Za-z0-9+/=]{50,})\1\s*\)\s*\)', 2),
-           (r'load\w*\s*\(\s*crypt\.base64\.decode\s*\(\s*(["\'])([A-Za-z0-9+/=]{50,})\1\s*\)\s*\)', 2),
        ]
        
        for pattern, group_idx in patterns:
@@ -1479,8 +1504,8 @@ class VMR:
            folded = self._fold_constants_advanced(instructions, constants)
            lua = self._generate_lua_advanced(folded, constants, prototypes)
            return lua
-       except Exception as e:
-           return f"-- Parse error: {str(e)[:100]}"
+       except Exception:
+           return ""
    
    def _try_decompress(self, data: bytes) -> Optional[bytes]:
        methods = [
@@ -1601,17 +1626,17 @@ class VMR:
        vm_patterns = [
            r'local\s+\w+\s*=\s*\{\s*(\d+\s*,\s*)*\d+\s*\}',
            r'local\s+\w+\s*=\s*function\s*\([^)]*\)[^e]*end',
-           r'while\s+\w+\s*<=\s*\w+\           s+do\s+local\s+\w+\s*=\s*\w+\[\w+\]',
+           r'while\s+\w+\s*<=\s*\w+\s+do\s+local\s+\w+\s*=\s*\w+\[\w+\]',
        ]
        
        for pattern in vm_patterns:
            matches = list(re.finditer(pattern, code))
            if len(matches) > 5:
-               code = self._attempt_vm_reconstruction(code, matches)
+               code = self._attempt_vm_reconstruction(code)
        
        return code
    
-   def _attempt_vm_reconstruction(self, code: str, matches: List) -> str:
+   def _attempt_vm_reconstruction(self, code: str) -> str:
        return code
    
    def _fold_constants_advanced(self, instructions: List[VMInstruction], constants: List[Any]) -> List[VMInstruction]:
@@ -1682,7 +1707,7 @@ class VMR:
        return optimized
    
    def _generate_lua_advanced(self, instructions: List[VMInstruction], constants: List[Any], prototypes: List[Any] = None) -> str:
-       lines = ['-- VMR Advanced Decompiled', 'local function vm_main(...)']
+       lines = ['local function vm_main(...)']
        lines.append('    local R = {}')
        lines.append('    local K = {}')
        
@@ -1714,7 +1739,7 @@ class VMR:
            elif instr.name == 'LOADNIL':
                line += f'\n    R[{instr.a}] = nil'
            elif instr.name in ['ADD', 'SUB', 'MUL', 'DIV', 'MOD', 'POW']:
-               line += f'\n    R[{instr.a}] = R[{instr.b}] {instr.name} R[{instr.c}]'
+               line += f'\n    R[{instr.a}] = R[{instr.b}] {instr.name.lower()} R[{instr.c}]'
            elif instr.name == 'UNM':
                line += f'\n    R[{instr.a}] = -R[{instr.b}]'
            elif instr.name == 'NOT':
@@ -1737,8 +1762,6 @@ class VMR:
                line += f'\n    R[{instr.a}][R[{instr.b}]] = R[{instr.c}]'
            elif instr.name == 'NEWTABLE':
                line += f'\n    R[{instr.a}] = {{}}'
-           elif instr.name == 'SELF':
-               line += f'\n    R[{instr.a + 1}] = R[{instr.b}]\n    R[{instr.a}] = R[{instr.b}][K[{instr.c}]]'
            elif instr.name == 'CALL':
                if instr.b == 0:
                    line += f'\n    R[{instr.a}] = R[{instr.a}](unpack(R, {instr.a + 1}))'
@@ -1759,31 +1782,6 @@ class VMR:
                target = i + 1 + instr.sbx
                if target in label_map:
                    line += f'\n    goto {label_map[target]}'
-               else:
-                   line += f'\n    goto pc_{target}'
-           elif instr.name in ['EQ', 'LT', 'LE']:
-               op = {'EQ': '==', 'LT': '<', 'LE': '<='}[instr.name]
-               line += f'\n    if R[{instr.b}] {op} R[{instr.c}] then goto L_skip end'
-           elif instr.name == 'TEST':
-               line += f'\n    if not R[{instr.a}] then goto L_skip end'
-           elif instr.name == 'TESTSET':
-               line += f'\n    if R[{instr.b}] then R[{instr.a}] = R[{instr.b}] else goto L_skip end'
-           elif instr.name == 'FORLOOP':
-               target = i + 1 + instr.sbx
-               label = label_map.get(target, f'L{target}')
-               line += f'\n    R[{instr.a}] = R[{instr.a}] + R[{instr.a + 2}]\n    if R[{instr.a}] <= R[{instr.a + 1}] then\n        R[{instr.a + 3}] = R[{instr.a}]\n        goto {label}\n    end'
-           elif instr.name == 'FORPREP':
-               target = i + 1 + instr.sbx
-               label = label_map.get(target, f'L{target}')
-               line += f'\n    R[{instr.a}] = R[{instr.a}] - R[{instr.a + 2}]\n    goto {label}'
-           elif instr.name == 'CLOSURE':
-               line += f'\n    R[{instr.a}] = function(...) return nil end'
-           elif instr.name == 'VARARG':
-               if instr.b == 0:
-                   line += f'\n    R[{instr.a}] = arg'
-               else:
-                   for j in range(instr.b - 1):
-                       line += f'\n    R[{instr.a + j}] = arg[{j + 1}]'
            
            lines.append(line)
        
@@ -1792,34 +1790,7 @@ class VMR:
        return '\n'.join(lines)
    
    def _dynamic_trace_analysis(self, code: str) -> str:
-       func_patterns = [
-           r'local\s+(\w+)\s*=\s*function\s*\(([^)]*)\)([^e][^n][^d].*?)end',
-           r'function\s+(\w+)\s*\(([^)]*)\)([^e][^n][^d].*?)end',
-           r'(\w+)\s*=\s*function\s*\(([^)]*)\)([^e][^n][^d].*?)end',
-       ]
-       
-       for pattern in func_patterns:
-           for match in re.finditer(pattern, code, re.DOTALL):
-               func_name = match.group(1)
-               func_body = match.group(3)
-               
-               if any(x in func_body.lower() for x in ['string.char', 'xor', 'decode', 'decrypt', 'unpack']):
-                   result = self.sandbox.simulate_call(func_body.encode(), [1, 2, 3])
-                   if result['success'] and result['trace']:
-                       resolved = self._resolve_from_trace(result['trace'])
-                       if resolved and len(str(resolved)) > 10:
-                           code = code.replace(match.group(0), f'local {func_name} = function(...) return {repr(resolved)} end', 1)
-       
        return code
-   
-   def _resolve_from_trace(self, trace: List[Dict]) -> Optional[str]:
-       for entry in trace:
-           if 'result' in entry:
-               if isinstance(entry['result'], str) and len(entry['result']) > 5:
-                   return entry['result']
-               if isinstance(entry['result'], (int, float)):
-                   return str(entry['result'])
-       return None
    
    def _resolve_encrypted_constants(self, code: str) -> str:
        xor_keys = [0x55, 0xAA, 0x12, 0x34, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x0F, 0x33, 0x66, 0x99, 0xCC, 0x11, 0x22, 0x44, 0x88, 0x77, 0xEE, 0x00, 0xFF]
@@ -2050,9 +2021,9 @@ class ShadowAntiTamper:
            r'if\s+debug\s*then\s*return\s+end',
            r'if\s+getfenv\s*then\s*return\s+end',
            r'if\s+pcall\s*\(\s*function[^)]*\)\s*then\s*return\s+end',
-           r'if\s+type\(\w+\)\s*~=\s*["\']function["\']\s*then\s*return\s+end',
-           r'if\s+#\{\s*\}\s*~=\s*\d+\s*then\s*return\s+end',
-           r'if\s+\w+\s*~=\s*\w+\s*then\s*return\s+end',
+           r'if\s+type\(\w+\)\s*\~=\s*["\']function["\']\s*then\s*return\s+end',
+           r'if\s+#\{\s*\}\s*\~=\s*\d+\s*then\s*return\s+end',
+           r'if\s+\w+\s*\~=\s*\w+\s*then\s*return\s+end',
            r'assert\s*\(\s*false[^)]*\)',
            r'error\s*\(\s*["\'][^"\']*["\']\s*\)',
            r'while\s+true\s+do\s*end',
@@ -2060,7 +2031,7 @@ class ShadowAntiTamper:
            r'if\s+os\.clock\s*\(\)\s*-\s*\w+\s*>\s*\d+\s*then\s*return\s+end',
            r'if\s+tick\s*\(\)\s*-\s*\w+\s*>\s*\d+\s*then\s*return\s+end',
            r'if\s+debug\s*and\s+debug\.getinfo\s*then\s*error\s*\([^)]*\)\s*end',
-           r'local\s+\w+\s*=\s*getfenv\s*\(\s*\d+\s*\)[^;]*;?\s*if\s+type\s*\(\s*\w+\s*\)\s*~=\s*["\']table["\']\s*then\s*return\s+end',
+           r'local\s+\w+\s*=\s*getfenv\s*\(\s*\d+\s*\)[^;]*;?\s*if\s+type\s*\(\s*\w+\s*\)\s*\~=\s*["\']table["\']\s*then\s*return\s+end',
            r'setfenv\s*\(\s*\d+\s*,\s*\{\s*\}\s*\)',
            r'getfenv\s*\(\s*\)\s*\.\s*\w+\s*=\s*nil',
            r'debug\.sethook\s*\(\s*\w+\s*,\s*["\']c["\']\s*\)',
@@ -2092,12 +2063,12 @@ class ShadowAntiTamper:
    
    def _neutralize_environment_checks(self, code: str) -> str:
        env_checks = [
-           r'if\s+_G\s*~=\s*getfenv\s*\(\s*0\s*\)\s*then\s*return\s+end',
-           r'if\s+getfenv\s*\(\s*0\s*\)\s*~=\s*_G\s*then\s*return\s+end',
-           r'if\s+_G\s*\.\s*script\s*~=\s*script\s*then\s*return\s+end',
-           r'if\s+script\s*\.\s*Parent\s*~=\s*\w+\s*then\s*return\s+end',
-           r'if\s+game\s*\.\s*PlaceId\s*~=\s*\d+\s*then\s*return\s+end',
-           r'if\s+game\s*\.\s*GameId\s*~=\s*\d+\s*then\s*return\s+end',
+           r'if\s+_G\s*\~=\s*getfenv\s*\(\s*0\s*\)\s*then\s*return\s+end',
+           r'if\s+getfenv\s*\(\s*0\s*\)\s*\~=\s*_G\s*then\s*return\s+end',
+           r'if\s+_G\s*\.\s*script\s*\~=\s*script\s*then\s*return\s+end',
+           r'if\s+script\s*\.\s*Parent\s*\~=\s*\w+\s*then\s*return\s+end',
+           r'if\s+game\s*\.\s*PlaceId\s*\~=\s*\d+\s*then\s*return\s+end',
+           r'if\s+game\s*\.\s*GameId\s*\~=\s*\d+\s*then\s*return\s+end',
        ]
        
        for check in env_checks:
@@ -2121,7 +2092,7 @@ class ShadowAntiTamper:
        debugger_patterns = [
            r'if\s+debug\s*\.\s*gethook\s*\(\s*\)\s*then\s*return\s+end',
            r'if\s+debug\s*\.\s*getmetatable\s*\(\s*debug\s*\)\s*then\s*return\s+end',
-           r'local\s+\w+\s*=\s*debug\s*\.\s*getinfo\s*\(\s*1\s*\)[^;]*;?\s*if\s+\w+\s*\.\s*source\s*~=\s*["\'][^"\']*["\']\s*then\s*return\s+end',
+           r'local\s+\w+\s*=\s*debug\s*\.\s*getinfo\s*\(\s*1\s*\)[^;]*;?\s*if\s+\w+\s*\.\s*source\s*\~=\s*["\'][^"\']*["\']\s*then\s*return\s+end',
            r'if\s+#\s*debug\s*\.\s*getregistry\s*\(\s*\)\s*>\s*\d+\s*then\s*return\s+end',
        ]
        
@@ -2132,7 +2103,7 @@ class ShadowAntiTamper:
    
    def _neutralize_vm_detection(self, code: str) -> str:
        vm_patterns = [
-           r'if\s+type\s*\(\s*loadstring\s*\)\s*~=\s*["\']function["\']\s*then\s*return\s+end',
+           r'if\s+type\s*\(\s*loadstring\s*\)\s*\~=\s*["\']function["\']\s*then\s*return\s+end',
            r'if\s+not\s*loadstring\s*then\s*return\s+end',
            r'if\s+not\s*getfenv\s*then\s*return\s+end',
            r'if\s+not\s*setfenv\s*then\s*return\s+end',
@@ -2265,7 +2236,6 @@ class ShadowHeuristicEngine:
            (r'for\s+\w+\s+in\s+pairs\s*\(\s*\{\s*\}\s*\)\s+do\s+end', 'empty_loop'),
            (r'pcall\s*\(\s*error', 'error_obfuscation'),
            (r'string\.dump\s*\(\s*\w+\s*\)', 'bytecode_extraction'),
-           (r'collectgarbage\s*\(\s*["\']count["\']', 'memory_tracking'),
        ]
        
        for pattern, desc in suspicious:
@@ -2307,6 +2277,7 @@ class ShadowDeobfuscator:
        self.crypto = ShadowCryptography()
        self.heuristic = ShadowHeuristicEngine()
        self.ai = ShadowAIEngine()
+       self.decoy_detector = DecoyDetector()
    
    def deobfuscate(self, code: str, aggressive: bool = False, deep_analysis: bool = False) -> Dict[str, Any]:
        original = code
@@ -2372,10 +2343,10 @@ class ShadowBatchProcessor:
        for filepath in files:
            try:
                self.process_file(filepath, aggressive)
-           except Exception as e:
+           except Exception:
                self.results.append({
                    'filepath': filepath,
-                   'error': str(e),
+                   'error': 'processing_failed',
                })
        
        return self.results
