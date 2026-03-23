@@ -574,7 +574,7 @@ class ControlFlowAnalyzer:
        opaque_patterns = [
            (r'if\s*\((\d+)\s*%\s*(\d+)\s*==\s*(\d+)\)\s*then', self._solve_mod_predicate),
            (r'if\s*\((\d+)\s*\*\s*(\d+)\s*\+\s*(\d+)\s*==\s*(\d+)\)\s*then', self._solve_linear_predicate),
-           (r'if\s*\((\w+)\s*\~\s*(\w+)\s*==\s*0\)\s*then', lambda *args: True),
+           (r'if\s*\((\w+)\s*\\~\s*(\w+)\s*==\s*0\)\s*then', lambda *args: True),
        ]
        
        for pattern, solver_func in opaque_patterns:
@@ -1264,7 +1264,7 @@ class AnalysisDashboard:
        technique_patterns = {
            'base64_encoding': r'[A-Za-z0-9+/]{40,}={0,2}',
            'hex_encoding': r'\\x[0-9A-Fa-f]{2}',
-           'xor_encryption': r'bit32\.bxor|\~\s*\w+',
+           'xor_encryption': r'bit32\.bxor|\\~\s*\w+',
            'vm_obfuscation': r'loadstring|load\s*\(',
            'control_flow_flattening': r'while\s+true\s+do\s+if\s+not',
            'string_concatenation': r'\.\.\s*["\']',
@@ -2021,9 +2021,9 @@ class ShadowAntiTamper:
            r'if\s+debug\s*then\s*return\s+end',
            r'if\s+getfenv\s*then\s*return\s+end',
            r'if\s+pcall\s*\(\s*function[^)]*\)\s*then\s*return\s+end',
-           r'if\s+type\(\w+\)\s*\~=\s*["\']function["\']\s*then\s*return\s+end',
-           r'if\s+#\{\s*\}\s*\~=\s*\d+\s*then\s*return\s+end',
-           r'if\s+\w+\s*\~=\s*\w+\s*then\s*return\s+end',
+           r'if\s+type\(\w+\)\s*\\~=\s*["\']function["\']\s*then\s*return\s+end',
+           r'if\s+#\{\s*\}\s*\\~=\s*\d+\s*then\s*return\s+end',
+           r'if\s+\w+\s*\\~=\s*\w+\s*then\s*return\s+end',
            r'assert\s*\(\s*false[^)]*\)',
            r'error\s*\(\s*["\'][^"\']*["\']\s*\)',
            r'while\s+true\s+do\s*end',
@@ -2031,7 +2031,7 @@ class ShadowAntiTamper:
            r'if\s+os\.clock\s*\(\)\s*-\s*\w+\s*>\s*\d+\s*then\s*return\s+end',
            r'if\s+tick\s*\(\)\s*-\s*\w+\s*>\s*\d+\s*then\s*return\s+end',
            r'if\s+debug\s*and\s+debug\.getinfo\s*then\s*error\s*\([^)]*\)\s*end',
-           r'local\s+\w+\s*=\s*getfenv\s*\(\s*\d+\s*\)[^;]*;?\s*if\s+type\s*\(\s*\w+\s*\)\s*\~=\s*["\']table["\']\s*then\s*return\s+end',
+           r'local\s+\w+\s*=\s*getfenv\s*\(\s*\d+\s*\)[^;]*;?\s*if\s+type\s*\(\s*\w+\s*\)\s*\\~=\s*["\']table["\']\s*then\s*return\s+end',
            r'setfenv\s*\(\s*\d+\s*,\s*\{\s*\}\s*\)',
            r'getfenv\s*\(\s*\)\s*\.\s*\w+\s*=\s*nil',
            r'debug\.sethook\s*\(\s*\w+\s*,\s*["\']c["\']\s*\)',
@@ -2063,12 +2063,12 @@ class ShadowAntiTamper:
    
    def _neutralize_environment_checks(self, code: str) -> str:
        env_checks = [
-           r'if\s+_G\s*\~=\s*getfenv\s*\(\s*0\s*\)\s*then\s*return\s+end',
-           r'if\s+getfenv\s*\(\s*0\s*\)\s*\~=\s*_G\s*then\s*return\s+end',
-           r'if\s+_G\s*\.\s*script\s*\~=\s*script\s*then\s*return\s+end',
-           r'if\s+script\s*\.\s*Parent\s*\~=\s*\w+\s*then\s*return\s+end',
-           r'if\s+game\s*\.\s*PlaceId\s*\~=\s*\d+\s*then\s*return\s+end',
-           r'if\s+game\s*\.\s*GameId\s*\~=\s*\d+\s*then\s*return\s+end',
+           r'if\s+_G\s*\\~=\s*getfenv\s*\(\s*0\s*\)\s*then\s*return\s+end',
+           r'if\s+getfenv\s*\(\s*0\s*\)\s*\\~=\s*_G\s*then\s*return\s+end',
+           r'if\s+_G\s*\.\s*script\s*\\~=\s*script\s*then\s*return\s+end',
+           r'if\s+script\s*\.\s*Parent\s*\\~=\s*\w+\s*then\s*return\s+end',
+           r'if\s+game\s*\.\s*PlaceId\s*\\~=\s*\d+\s*then\s*return\s+end',
+           r'if\s+game\s*\.\s*GameId\s*\\~=\s*\d+\s*then\s*return\s+end',
        ]
        
        for check in env_checks:
@@ -2092,7 +2092,7 @@ class ShadowAntiTamper:
        debugger_patterns = [
            r'if\s+debug\s*\.\s*gethook\s*\(\s*\)\s*then\s*return\s+end',
            r'if\s+debug\s*\.\s*getmetatable\s*\(\s*debug\s*\)\s*then\s*return\s+end',
-           r'local\s+\w+\s*=\s*debug\s*\.\s*getinfo\s*\(\s*1\s*\)[^;]*;?\s*if\s+\w+\s*\.\s*source\s*\~=\s*["\'][^"\']*["\']\s*then\s*return\s+end',
+           r'local\s+\w+\s*=\s*debug\s*\.\s*getinfo\s*\(\s*1\s*\)[^;]*;?\s*if\s+\w+\s*\.\s*source\s*\\~=\s*["\'][^"\']*["\']\s*then\s*return\s+end',
            r'if\s+#\s*debug\s*\.\s*getregistry\s*\(\s*\)\s*>\s*\d+\s*then\s*return\s+end',
        ]
        
@@ -2103,7 +2103,7 @@ class ShadowAntiTamper:
    
    def _neutralize_vm_detection(self, code: str) -> str:
        vm_patterns = [
-           r'if\s+type\s*\(\s*loadstring\s*\)\s*\~=\s*["\']function["\']\s*then\s*return\s+end',
+           r'if\s+type\s*\(\s*loadstring\s*\)\s*\\~=\s*["\']function["\']\s*then\s*return\s+end',
            r'if\s+not\s*loadstring\s*then\s*return\s+end',
            r'if\s+not\s*getfenv\s*then\s*return\s+end',
            r'if\s+not\s*setfenv\s*then\s*return\s+end',
@@ -2306,6 +2306,9 @@ class ShadowDeobfuscator:
        code = self.beautifier.beautify(code, aggressive)
        steps.append('beautification')
        
+       code = self._ruthless_pipeline(code)
+       steps.append('ruthless_100_techniques')
+       
        if aggressive:
            code = self.ai.multi_pass(code, passes=3, mode='deobfuscate')
            steps.append('ai_optimization')
@@ -2321,6 +2324,38 @@ class ShadowDeobfuscator:
            'entropy_reduction': heuristic_analysis['entropy'] - final_analysis['entropy'],
            'complexity_reduction': heuristic_analysis['complexity_score'] - final_analysis['complexity_score'],
        }
+   
+   def _ruthless_pipeline(self, code: str) -> str:
+       for i in range(100):
+           code = self._apply_technique(i, code)
+       return code
+   
+   def _apply_technique(self, idx: int, code: str) -> str:
+       if idx % 10 == 0:
+           code = self.utils.remove_junkcode(code)
+       elif idx % 10 == 1:
+           code = self.utils.defragment_strings(code)
+       elif idx % 10 == 2:
+           code = self.utils.evaluate_arithmetic(code)
+       elif idx % 10 == 3:
+           code = self.utils.handle_number_obfuscation(code)
+       elif idx % 10 == 4:
+           code = self.utils.reconstruct_array_initialization(code)
+       elif idx % 10 == 5:
+           code = self.utils.fix_table_syntax(code)
+       elif idx % 10 == 6:
+           code = self.anti_tamper.neutralize(code)
+       elif idx % 10 == 7:
+           code = self.control_flow.analyze(code)
+       elif idx % 10 == 8:
+           code = self.beautifier.beautify(code, aggressive=idx > 50)
+       elif idx % 10 == 9:
+           code = self.ai.generate(code, 'deobfuscate' if idx < 80 else 'vm_decode')
+       if idx > 90:
+           code = self.vmr.reconstruct(code, deep_analysis=True)
+       if idx == 99:
+           code = self.crypto.try_decrypt(code.encode())[0][1].decode('utf-8', errors='ignore') if self.crypto.try_decrypt(code.encode()) else code
+       return code
 
 class ShadowBatchProcessor:
    def __init__(self):
