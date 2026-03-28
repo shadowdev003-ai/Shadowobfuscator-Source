@@ -33,6 +33,16 @@ from enum import Enum, auto
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 import networkx as nx
+import argparse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+import resource
+import signal
+import html
+import logging
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 try:
    import luaparser
@@ -148,6 +158,8 @@ class ShadowAIEngine:
            'vm_decode': f"Decode this Lua VM bytecode. Reconstruct original opcodes, resolve constants, return decompiled code:\n\n{prompt}",
            'security': f"Analyze security risks. Find backdoors, malicious patterns, data exfiltration attempts:\n\n{prompt}",
            'rename': f"Rename all variables in this Lua code to meaningful names based on context. Return only the renamed code:\n\n{prompt}",
+           'moonsec': f"Detect and fully decrypt MoonSec v1/v2/v3 protected Lua code. Handle rolling XOR, custom VM, return clean code:\n\n{prompt}",
+           'wrd': f"Detect and fully deobfuscate WRD protected Lua code. Unflatten state machine, decrypt string table, disable anti-debug:\n\n{prompt}",
        }
        return templates.get(mode, templates['deobfuscate'])
    
@@ -208,6 +220,8 @@ class ShadowAIEngine:
            elif mode == 'vm_decode':
                score += len(re.findall(r'--\s*\[\d+\]', result)) * 5
                score += len(re.findall(r'local\s+R\s*\[', result)) * 3
+           elif mode in ['moonsec', 'wrd']:
+               score += len(re.findall(r'function|local|return', result)) * 15
            
            score += min(len(result) / 100, 50)
            scored.append((score, result))
@@ -217,9 +231,15 @@ class ShadowAIEngine:
    
    def multi_pass(self, code: str, passes: int = 3, mode: str = 'deobfuscate') -> str:
        current = code
-       for i in range(passes):
-           current = self.generate(current, mode)
-           time.sleep(0.3)
+       with ThreadPoolExecutor(max_workers=3) as executor:
+           futures = []
+           for i in range(passes):
+               futures.append(executor.submit(self.generate, current, mode))
+           for future in futures:
+               result = future.result()
+               if result and len(result) > len(current):
+                   current = result
+               time.sleep(0.3)
        return current
 
 class SafeEvaluator:
@@ -239,35 +259,47 @@ class SafeEvaluator:
            'hex': hex, 'bin': bin, 'oct': oct,
            'math': math, 'string': string,
        }
+       self.max_nodes = 500
+       self.max_depth = 20
    
    def eval(self, expr: str) -> Any:
        try:
            tree = ast.parse(expr, mode='eval')
+           if self._count_nodes(tree) > self.max_nodes:
+               return expr
            return self._eval_node(tree.body)
        except:
            return expr
    
-   def _eval_node(self, node: ast.AST) -> Any:
+   def _count_nodes(self, node: ast.AST) -> int:
+       count = 1
+       for child in ast.iter_child_nodes(node):
+           count += self._count_nodes(child)
+       return count
+   
+   def _eval_node(self, node: ast.AST, depth: int = 0) -> Any:
+       if depth > self.max_depth:
+           raise ValueError("Max depth exceeded")
        if isinstance(node, ast.Num):
            return node.n
        elif isinstance(node, ast.Constant):
            return node.value
        elif isinstance(node, ast.BinOp):
-           left = self._eval_node(node.left)
-           right = self._eval_node(node.right)
+           left = self._eval_node(node.left, depth + 1)
+           right = self._eval_node(node.right, depth + 1)
            op_type = type(node.op)
            if op_type in self.allowed_ops:
                return self.allowed_ops[op_type](left, right)
            raise ValueError(f"Unsupported operator: {op_type}")
        elif isinstance(node, ast.UnaryOp):
-           operand = self._eval_node(node.operand)
+           operand = self._eval_node(node.operand, depth + 1)
            op_type = type(node.op)
            if op_type in self.allowed_ops:
                return self.allowed_ops[op_type](operand)
            raise ValueError(f"Unsupported unary: {op_type}")
        elif isinstance(node, ast.Call):
            if isinstance(node.func, ast.Name) and node.func.id in self.allowed_names:
-               args = [self._eval_node(arg) for arg in node.args]
+               args = [self._eval_node(arg, depth + 1) for arg in node.args]
                return self.allowed_names[node.func.id](*args)
            raise ValueError(f"Unsupported call: {node.func}")
        elif isinstance(node, ast.Name):
@@ -275,14 +307,14 @@ class SafeEvaluator:
                return self.allowed_names[node.id]
            raise ValueError(f"Unknown: {node.id}")
        elif isinstance(node, ast.Subscript):
-           value = self._eval_node(node.value)
-           slice_val = self._eval_node(node.slice)
+           value = self._eval_node(node.value, depth + 1)
+           slice_val = self._eval_node(node.slice, depth + 1)
            return value[slice_val]
        elif isinstance(node, ast.Attribute):
-           value = self._eval_node(node.value)
+           value = self._eval_node(node.value, depth + 1)
            return getattr(value, node.attr)
        elif isinstance(node, (ast.Tuple, ast.List)):
-           return [self._eval_node(elt) for elt in node.elts]
+           return [self._eval_node(elt, depth + 1) for elt in node.elts]
        else:
            raise ValueError(f"Unsupported: {type(node)}")
 
@@ -503,6 +535,7 @@ class ControlFlowAnalyzer:
        code = self._unflatten_control_flow(code)
        code = self._solve_opaque_predicates(code)
        code = self._resolve_dynamic_gotos(code)
+       code = self._wrd_state_machine_unflatten(code)
        return code
    
    def _build_cfg(self, code: str):
@@ -574,7 +607,7 @@ class ControlFlowAnalyzer:
        opaque_patterns = [
            (r'if\s*\((\d+)\s*%\s*(\d+)\s*==\s*(\d+)\)\s*then', self._solve_mod_predicate),
            (r'if\s*\((\d+)\s*\*\s*(\d+)\s*\+\s*(\d+)\s*==\s*(\d+)\)\s*then', self._solve_linear_predicate),
-           (r'if\s*\((\w+)\s*\\~\s*(\w+)\s*==\s*0\)\s*then', lambda *args: True),
+           (r'if\s*\((\w+)\s*\\\\~\s*(\w+)\s*==\s*0\)\s*then', lambda *args: True),
        ]
        
        for pattern, solver_func in opaque_patterns:
@@ -611,6 +644,15 @@ class ControlFlowAnalyzer:
            lambda m: f'goto {label_map.get(m.group(1), "UNKNOWN_LABEL")}',
            code
        )
+   
+   def _wrd_state_machine_unflatten(self, code: str) -> str:
+       wrd_pattern = r'local\s+\w+\s*=\s*0\s*while\s+true\s+do\s+local\s+\w+\s*=\s*\w+\[\w+\]\s*if\s+\w+\s*==\s*(\d+)\s+then'
+       if re.search(wrd_pattern, code):
+           code = re.sub(r'local\s+\w+\s*=\s*0', '', code)
+           code = re.sub(r'while\s+true\s+do', '', code)
+           code = re.sub(r'local\s+\w+\s*=\s*\w+\[\w+\]', '', code)
+           code = re.sub(r'if\s+\w+\s*==\s*(\d+)\s+then', r'-- WRD state \1', code)
+       return code
 
 class ShadowSandbox:
    def __init__(self):
@@ -647,14 +689,21 @@ class ShadowSandbox:
            'tonumber': lambda x, base=10: int(x, base) if base != 10 else float(x),
            'loadstring': lambda x: compile(x, '<string>', 'exec'),
            'load': lambda x, *a: compile(x.read() if hasattr(x, 'read') else x, '<string>', 'exec'),
-           'dofile': lambda f: exec(open(f).read()),
-           'require': lambda m: __import__(m),
        }
        self.lua_runtime = LuaRuntime(unpack_returned_tuples=True) if LUPA_AVAILABLE else None
+       self.max_execution_time = 5
+       self.max_memory = 50 * 1024 * 1024
    
    def simulate_call(self, func_bytes: bytes, args: List[Any]) -> Dict[str, Any]:
+       resource.setrlimit(resource.RLIMIT_AS, (self.max_memory, self.max_memory))
        self.virtual_stack = list(args)
        self.call_stack.append({'func': func_bytes, 'pc': 0, 'locals': {}, 'upvalues': {}})
+       
+       def timeout_handler(signum, frame):
+           raise TimeoutError("Sandbox execution timeout")
+       
+       signal.signal(signal.SIGALRM, timeout_handler)
+       signal.alarm(self.max_execution_time)
        
        try:
            if func_bytes[:4] == b'\x1bLua':
@@ -678,6 +727,8 @@ class ShadowSandbox:
                'heap': self.heap,
                'registers': self.registers,
            }
+       finally:
+           signal.alarm(0)
    
    def _simulate_lua_bytecode(self, bytecode: bytes) -> Any:
        pos = 12
@@ -700,7 +751,7 @@ class ShadowSandbox:
            size = read_size_t()
            if size == 0:
                return ""
-           result = bytecode[pos:pos+size-1].decode('utf-8', errors='ignore')
+           result = bytecode[pos:pos+size-1].decode('utf-8', errors='replace')
            pos += size
            return result
        
@@ -1264,13 +1315,15 @@ class AnalysisDashboard:
        technique_patterns = {
            'base64_encoding': r'[A-Za-z0-9+/]{40,}={0,2}',
            'hex_encoding': r'\\x[0-9A-Fa-f]{2}',
-           'xor_encryption': r'bit32\.bxor|\\~\s*\w+',
+           'xor_encryption': r'bit32\.bxor|\\\\~\s*\w+',
            'vm_obfuscation': r'loadstring|load\s*\(',
            'control_flow_flattening': r'while\s+true\s+do\s+if\s+not',
            'string_concatenation': r'\.\.\s*["\']',
            'dead_code': r'if\s+false\s+then|while\s+false\s+do',
            'anti_debug': r'debug\.getinfo|debug\.traceback',
            'bytecode_encoding': r'[\x00-\x08\x0b\x0c\x0e-\x1f]{10,}',
+           'moonsec_vm': r'MoonSec|rolling_xor|custom_vm',
+           'wrd_state': r'WRD|state_machine',
        }
        
        for name, pattern in technique_patterns.items():
@@ -1300,6 +1353,12 @@ class AnalysisDashboard:
    def export_report(self, report: Dict, format: str = 'json') -> str:
        if format == 'json':
            return json.dumps(report, indent=2)
+       elif format == 'html':
+           html_str = f'''<html><head><title>ShadowDeobfuscator Report</title><style>body{{font-family:Arial}}table{{border-collapse:collapse}}th,td{{border:1px solid #ddd;padding:8px}}</style></head><body><h1>Deobfuscation Report</h1><p>Original size: {report['original_size']}</p><p>Deobfuscated size: {report['deobfuscated_size']}</p><h2>Threat Assessment</h2><p>Level: {report['threat_assessment']['level']}</p><table><tr><th>Issue</th><th>Severity</th></tr>'''
+           for issue in report['threat_assessment']['issues']:
+               html_str += f"<tr><td>{issue['description']}</td><td>{issue['severity']}</td></tr>"
+           html_str += '</table></body></html>'
+           return html_str
        return ''
 
 class ConstantTracker:
@@ -1398,7 +1457,44 @@ class Utils:
    
    @staticmethod
    def defragment_strings(code: str) -> str:
-       return re.sub(r'(".*?")\s*\n\s*"(.*?")', lambda m: f'"{m.group(1)[1:-1]}{m.group(2)[1:-1]}"', code)
+       code = re.sub(r'(".*?")\s*\n\s*"(.*?")', lambda m: f'"{m.group(1)[1:-1]}{m.group(2)[1:-1]}"', code)
+       code = re.sub(r'\.\.\s*', '', code)
+       return code
+   
+   @staticmethod
+   def decode_arabic_hex(code: str) -> str:
+       code = re.sub(r'\\x([0-9A-Fa-f]{2})', lambda m: chr(int(m.group(1), 16)), code)
+       code = re.sub(r'string\.char\s*\(\s*([0-9,\s]+)\s*\)', lambda m: '"' + ''.join(chr(int(x.strip())) for x in m.group(1).split(',')) + '"', code, flags=re.IGNORECASE)
+       code = re.sub(r'\{(0x[0-9a-fA-F]+(?:,\s*0x[0-9a-fA-F]+)*)\}', lambda m: '"' + ''.join(chr(int(x, 16)) for x in re.findall(r'0x[0-9a-fA-F]+', m.group(1))) + '"', code)
+       return code
+   
+   @staticmethod
+   def safe_utf8_decode(code: str) -> str:
+       try:
+           return code.encode('utf-8', errors='replace').decode('utf-8', errors='replace')
+       except:
+           return code
+
+class MoonSecSupport:
+   @staticmethod
+   def detect_and_decrypt(code: str) -> str:
+       if re.search(r'This file was protected with MoonSec', code, re.IGNORECASE) or re.search(r'MoonSec V[0-9]', code, re.IGNORECASE):
+           code = re.sub(r'local\s+\w+\s*=\s*function\s*\(\)\s*local\s+\w+\s*=\s*\{', '', code)
+           for i in range(256):
+               code = re.sub(rf'\{i}\s*\^\s*(\d+)', lambda m: chr(int(m.group(1)) ^ i), code)
+           code = re.sub(r'local\s+\w+\s*=\s*loadstring', 'local func = loadstring', code)
+           return code
+       return code
+
+class WRDSupport:
+   @staticmethod
+   def detect_and_decrypt(code: str) -> str:
+       if re.search(r'wearedevs\.net/obfuscator', code, re.IGNORECASE) or re.search(r'v1\.0\.0', code):
+           code = re.sub(r'local\s+\w+\s*=\s*0\s*while true do', '', code)
+           code = re.sub(r'if\s+\w+\s*==\s*(\d+)\s+then', '', code)
+           code = re.sub(r'debug\.getinfo|os\.clock|tick', '', code)
+           return code
+       return code
 
 class VMR:
    def __init__(self):
@@ -1416,10 +1512,15 @@ class VMR:
        self.decoy_detector = DecoyDetector()
        self.constant_tracker = ConstantTracker()
        self.utils = Utils()
+       self.moonsec = MoonSecSupport()
+       self.wrd = WRDSupport()
    
    def reconstruct(self, code: str, deep_analysis: bool = False, max_iterations: int = 5) -> str:
        original = code
        iteration = 0
+       
+       code = self.moonsec.detect_and_decrypt(code)
+       code = self.wrd.detect_and_decrypt(code)
        
        while iteration < max_iterations:
            prev_code = code
@@ -1446,6 +1547,10 @@ class VMR:
            code = self.utils.evaluate_arithmetic(code)
            code = self.utils.reconstruct_array_initialization(code)
            code = self.utils.fix_table_syntax(code)
+           code = self.utils.decode_arabic_hex(code)
+           code = self.utils.safe_utf8_decode(code)
+           code = self.moonsec.detect_and_decrypt(code)
+           code = self.wrd.detect_and_decrypt(code)
            
            if code == prev_code:
                break
@@ -1462,10 +1567,15 @@ class VMR:
            (r'loadstring\s*\(\s*(["\'])([A-Za-z0-9+/=]{50,})\1\s*\)', 2),
            (r'load\s*\(\s*function\s*\(\)[^}]*return\s*(["\'])([A-Za-z0-9+/=]{50,})\1\s*end\s*\)', 2),
            (r'local\s+\w+\s*=\s*(["\'])([A-Za-z0-9+/=]{50,})\1[^;]*;?\s*loadstring\s*\(\s*\w+\s*\)', 2),
+           (r'MoonSec|WRD', 0),
        ]
        
        for pattern, group_idx in patterns:
            for match in re.finditer(pattern, code):
+               if group_idx == 0:
+                   code = self.moonsec.detect_and_decrypt(code)
+                   code = self.wrd.detect_and_decrypt(code)
+                   continue
                encoded = match.group(group_idx)
                cache_key = hashlib.md5(encoded.encode()).hexdigest()
                
@@ -1561,7 +1671,7 @@ class VMR:
            size = read_size_t()
            if size == 0:
                return ""
-           result = bytecode[pos:pos+size-1].decode('utf-8', errors='ignore')
+           result = bytecode[pos:pos+size-1].decode('utf-8', errors='replace')
            pos += size
            return result
        
@@ -1800,8 +1910,8 @@ class VMR:
            hex_str = match.group(1)
            if len(hex_str) % 2 == 0 and len(hex_str) > 4:
                try:
-                   decoded = bytes.fromhex(hex_str).decode('utf-8', errors='ignore')
-                   if all(32 <= ord(c) < 127 for c in decoded) and len(decoded) > 3:
+                   decoded = bytes.fromhex(hex_str).decode('utf-8', errors='replace')
+                   if all(32 <= ord(c) < 127 or 1536 <= ord(c) <= 1791 for c in decoded) and len(decoded) > 3:
                        code = code.replace(match.group(0), f'"{decoded}"', 1)
                except:
                    pass
@@ -1810,8 +1920,8 @@ class VMR:
        for match in re.finditer(b64_pattern, code):
            encoded = match.group(1)
            try:
-               decoded = base64.b64decode(encoded).decode('utf-8', errors='ignore')
-               if all(32 <= ord(c) < 127 for c in decoded) and len(decoded) > 5:
+               decoded = base64.b64decode(encoded).decode('utf-8', errors='replace')
+               if all(32 <= ord(c) < 127 or 1536 <= ord(c) <= 1791 for c in decoded) and len(decoded) > 5:
                    code = code.replace(match.group(0), f'"{decoded}"', 1)
                    continue
            except:
@@ -1820,7 +1930,7 @@ class VMR:
            for key in xor_keys:
                try:
                    xored = ''.join(chr(ord(c) ^ key) for c in encoded)
-                   if all(32 <= ord(c) < 127 for c in xored) and len(xored) > 5:
+                   if all(32 <= ord(c) < 127 or 1536 <= ord(c) <= 1791 for c in xored) and len(xored) > 5:
                        code = code.replace(match.group(0), f'"{xored}"', 1)
                        break
                except:
@@ -1831,7 +1941,7 @@ class VMR:
            try:
                nums = [int(x.strip()) for x in match.group(1).split(',') if x.strip()]
                decoded = ''.join(chr(n) for n in nums if 0 <= n < 256)
-               if all(32 <= ord(c) < 127 for c in decoded) and len(decoded) > 3:
+               if all(32 <= ord(c) < 127 or 1536 <= ord(c) <= 1791 for c in decoded) and len(decoded) > 3:
                    code = code.replace(match.group(0), f'"{decoded}"', 1)
            except:
                pass
@@ -2021,9 +2131,9 @@ class ShadowAntiTamper:
            r'if\s+debug\s*then\s*return\s+end',
            r'if\s+getfenv\s*then\s*return\s+end',
            r'if\s+pcall\s*\(\s*function[^)]*\)\s*then\s*return\s+end',
-           r'if\s+type\(\w+\)\s*\\~=\s*["\']function["\']\s*then\s*return\s+end',
-           r'if\s+#\{\s*\}\s*\\~=\s*\d+\s*then\s*return\s+end',
-           r'if\s+\w+\s*\\~=\s*\w+\s*then\s*return\s+end',
+           r'if\s+type\(\w+\)\s*\\\\~=\s*["\']function["\']\s*then\s*return\s+end',
+           r'if\s+#\{\s*\}\s*\\\\~=\s*\d+\s*then\s*return\s+end',
+           r'if\s+\w+\s*\\\\~=\s*\w+\s*then\s*return\s+end',
            r'assert\s*\(\s*false[^)]*\)',
            r'error\s*\(\s*["\'][^"\']*["\']\s*\)',
            r'while\s+true\s+do\s*end',
@@ -2031,7 +2141,7 @@ class ShadowAntiTamper:
            r'if\s+os\.clock\s*\(\)\s*-\s*\w+\s*>\s*\d+\s*then\s*return\s+end',
            r'if\s+tick\s*\(\)\s*-\s*\w+\s*>\s*\d+\s*then\s*return\s+end',
            r'if\s+debug\s*and\s+debug\.getinfo\s*then\s*error\s*\([^)]*\)\s*end',
-           r'local\s+\w+\s*=\s*getfenv\s*\(\s*\d+\s*\)[^;]*;?\s*if\s+type\s*\(\s*\w+\s*\)\s*\\~=\s*["\']table["\']\s*then\s*return\s+end',
+           r'local\s+\w+\s*=\s*getfenv\s*\(\s*\d+\s*\)[^;]*;?\s*if\s+type\s*\(\s*\w+\s*\)\s*\\\\~=\s*["\']table["\']\s*then\s*return\s+end',
            r'setfenv\s*\(\s*\d+\s*,\s*\{\s*\}\s*\)',
            r'getfenv\s*\(\s*\)\s*\.\s*\w+\s*=\s*nil',
            r'debug\.sethook\s*\(\s*\w+\s*,\s*["\']c["\']\s*\)',
@@ -2063,12 +2173,12 @@ class ShadowAntiTamper:
    
    def _neutralize_environment_checks(self, code: str) -> str:
        env_checks = [
-           r'if\s+_G\s*\\~=\s*getfenv\s*\(\s*0\s*\)\s*then\s*return\s+end',
-           r'if\s+getfenv\s*\(\s*0\s*\)\s*\\~=\s*_G\s*then\s*return\s+end',
-           r'if\s+_G\s*\.\s*script\s*\\~=\s*script\s*then\s*return\s+end',
-           r'if\s+script\s*\.\s*Parent\s*\\~=\s*\w+\s*then\s*return\s+end',
-           r'if\s+game\s*\.\s*PlaceId\s*\\~=\s*\d+\s*then\s*return\s+end',
-           r'if\s+game\s*\.\s*GameId\s*\\~=\s*\d+\s*then\s*return\s+end',
+           r'if\s+_G\s*\\\\~=\s*getfenv\s*\(\s*0\s*\)\s*then\s*return\s+end',
+           r'if\s+getfenv\s*\(\s*0\s*\)\s*\\\\~=\s*_G\s*then\s*return\s+end',
+           r'if\s+_G\s*\.\s*script\s*\\\\~=\s*script\s*then\s*return\s+end',
+           r'if\s+script\s*\.\s*Parent\s*\\\\~=\s*\w+\s*then\s*return\s+end',
+           r'if\s+game\s*\.\s*PlaceId\s*\\\\~=\s*\d+\s*then\s*return\s+end',
+           r'if\s+game\s*\.\s*GameId\s*\\\\~=\s*\d+\s*then\s*return\s+end',
        ]
        
        for check in env_checks:
@@ -2092,7 +2202,7 @@ class ShadowAntiTamper:
        debugger_patterns = [
            r'if\s+debug\s*\.\s*gethook\s*\(\s*\)\s*then\s*return\s+end',
            r'if\s+debug\s*\.\s*getmetatable\s*\(\s*debug\s*\)\s*then\s*return\s+end',
-           r'local\s+\w+\s*=\s*debug\s*\.\s*getinfo\s*\(\s*1\s*\)[^;]*;?\s*if\s+\w+\s*\.\s*source\s*\\~=\s*["\'][^"\']*["\']\s*then\s*return\s+end',
+           r'local\s+\w+\s*=\s*debug\s*\.\s*getinfo\s*\(\s*1\s*\)[^;]*;?\s*if\s+\w+\s*\.\s*source\s*\\\\~=\s*["\'][^"\']*["\']\s*then\s*return\s+end',
            r'if\s+#\s*debug\s*\.\s*getregistry\s*\(\s*\)\s*>\s*\d+\s*then\s*return\s+end',
        ]
        
@@ -2103,7 +2213,7 @@ class ShadowAntiTamper:
    
    def _neutralize_vm_detection(self, code: str) -> str:
        vm_patterns = [
-           r'if\s+type\s*\(\s*loadstring\s*\)\s*\\~=\s*["\']function["\']\s*then\s*return\s+end',
+           r'if\s+type\s*\(\s*loadstring\s*\)\s*\\\\~=\s*["\']function["\']\s*then\s*return\s+end',
            r'if\s+not\s*loadstring\s*then\s*return\s+end',
            r'if\s+not\s*getfenv\s*then\s*return\s+end',
            r'if\s+not\s*setfenv\s*then\s*return\s+end',
@@ -2174,7 +2284,7 @@ class ShadowCryptography:
        if data.startswith(b'\x1bLua'):
            return True
        try:
-           text = data.decode('utf-8', errors='ignore')
+           text = data.decode('utf-8', errors='replace')
            lua_indicators = ['function', 'local', 'end', 'if', 'then', 'else', 'while', 'for', 'do', 'return']
            score = sum(1 for ind in lua_indicators if ind in text)
            return score >= 3 and len(text) > 50
@@ -2186,15 +2296,15 @@ class ShadowCryptography:
        current = b''
        
        for byte in data:
-           if 32 <= byte < 127:
+           if 32 <= byte < 127 or 1536 <= byte <= 1791:
                current += bytes([byte])
            else:
                if len(current) >= 4:
-                   strings.append(current.decode('utf-8', errors='ignore'))
+                   strings.append(current.decode('utf-8', errors='replace'))
                current = b''
        
        if len(current) >= 4:
-           strings.append(current.decode('utf-8', errors='ignore'))
+           strings.append(current.decode('utf-8', errors='replace'))
        
        return strings
 
@@ -2236,6 +2346,8 @@ class ShadowHeuristicEngine:
            (r'for\s+\w+\s+in\s+pairs\s*\(\s*\{\s*\}\s*\)\s+do\s+end', 'empty_loop'),
            (r'pcall\s*\(\s*error', 'error_obfuscation'),
            (r'string\.dump\s*\(\s*\w+\s*\)', 'bytecode_extraction'),
+           (r'MoonSec|rolling_xor', 'moonsec_obfuscation'),
+           (r'WRD|state_machine', 'wrd_obfuscation'),
        ]
        
        for pattern, desc in suspicious:
@@ -2278,10 +2390,19 @@ class ShadowDeobfuscator:
        self.heuristic = ShadowHeuristicEngine()
        self.ai = ShadowAIEngine()
        self.decoy_detector = DecoyDetector()
+       self.utils = Utils()
    
    def deobfuscate(self, code: str, aggressive: bool = False, deep_analysis: bool = False) -> Dict[str, Any]:
        original = code
        steps = []
+       
+       if re.search(r'This file was protected with MoonSec', code, re.IGNORECASE):
+           steps.append('moonsec_signature_detected')
+       if re.search(r'wearedevs\.net/obfuscator', code, re.IGNORECASE) or re.search(r'v1\.0\.0', code):
+           steps.append('wrd_signature_detected')
+       
+       if not any(s in ['moonsec_signature_detected', 'wrd_signature_detected'] for s in steps):
+           steps.append('forced_both_decryptors')
        
        code = self.anti_tamper.neutralize(code)
        steps.append('neutralized_anti_tamper')
@@ -2294,7 +2415,7 @@ class ShadowDeobfuscator:
        
        crypto_results = self.crypto.try_decrypt(code.encode())
        if crypto_results:
-           code = crypto_results[0][1].decode('utf-8', errors='ignore')
+           code = crypto_results[0][1].decode('utf-8', errors='replace')
            steps.append(f'decrypted_{crypto_results[0][0]}')
        
        code = self.vmr.reconstruct(code, deep_analysis)
@@ -2326,7 +2447,7 @@ class ShadowDeobfuscator:
        }
    
    def _ruthless_pipeline(self, code: str) -> str:
-       for i in range(100):
+       for i in range(30):
            code = self._apply_technique(i, code)
        return code
    
@@ -2348,13 +2469,13 @@ class ShadowDeobfuscator:
        elif idx % 10 == 7:
            code = self.control_flow.analyze(code)
        elif idx % 10 == 8:
-           code = self.beautifier.beautify(code, aggressive=idx > 50)
+           code = self.beautifier.beautify(code, aggressive=idx > 15)
        elif idx % 10 == 9:
-           code = self.ai.generate(code, 'deobfuscate' if idx < 80 else 'vm_decode')
-       if idx > 90:
+           code = self.ai.generate(code, 'deobfuscate' if idx < 20 else 'vm_decode')
+       if idx > 25:
            code = self.vmr.reconstruct(code, deep_analysis=True)
-       if idx == 99:
-           code = self.crypto.try_decrypt(code.encode())[0][1].decode('utf-8', errors='ignore') if self.crypto.try_decrypt(code.encode()) else code
+       if idx == 29:
+           code = self.crypto.try_decrypt(code.encode())[0][1].decode('utf-8', errors='replace') if self.crypto.try_decrypt(code.encode()) else code
        return code
 
 class ShadowBatchProcessor:
@@ -2363,7 +2484,7 @@ class ShadowBatchProcessor:
        self.results = []
    
    def process_file(self, filepath: str, aggressive: bool = False) -> Dict[str, Any]:
-       with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+       with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
            code = f.read()
        
        result = self.deobfuscator.deobfuscate(code, aggressive)
@@ -2410,24 +2531,68 @@ class ShadowBatchProcessor:
                        'entropy_reduction': result['entropy_reduction'],
                        'complexity_reduction': result['complexity_reduction'],
                    }, f, indent=2)
+           elif format == 'html':
+               report_path = os.path.join(output_dir, f'{name}_report.html')
+               with open(report_path, 'w', encoding='utf-8') as f:
+                   f.write(self.results[0]['dashboard'].export_report(result, 'html'))
 
 def main():
+   parser = argparse.ArgumentParser(description='ShadowDeobfuscator - Ultimate Luau Deobfuscator')
+   parser.add_argument('input', help='Path to Lua file or URL to obfuscated script')
+   parser.add_argument('--aggressive', action='store_true', help='Enable aggressive deobfuscation')
+   parser.add_argument('--deep', action='store_true', help='Enable deep VM analysis')
+   parser.add_argument('--output', default='deobfuscated.lua', help='Output file name')
+   parser.add_argument('--format', choices=['json', 'html'], default='json', help='Report format')
+   args = parser.parse_args()
+   
+   if args.input.startswith(('http://', 'https://')):
+       try:
+           response = requests.get(args.input, timeout=30)
+           response.raise_for_status()
+           code = response.text
+       except Exception:
+           code = ''
+   else:
+       try:
+           with open(args.input, 'r', encoding='utf-8', errors='replace') as f:
+               code = f.read()
+       except Exception:
+           code = ''
+   
+   if not code:
+       print('Failed to load input')
+       return
+   
    deobfuscator = ShadowDeobfuscator()
+   result = deobfuscator.deobfuscate(code, args.aggressive, args.deep)
    
-   sample_code = '''
-   local _0x1a2b = "SGVsbG8gV29ybGQ="
-   local _0x3c4d = loadstring
-   local _0x5e6f = _0x3c4d(game:HttpGet("https://example.com/script.lua"))
-   _0x5e6f()
-   '''
+   output_dir = os.path.dirname(args.output) or '.'
+   os.makedirs(output_dir, exist_ok=True)
+   with open(args.output, 'w', encoding='utf-8') as f:
+       f.write(result['deobfuscated'])
    
-   result = deobfuscator.deobfuscate(sample_code, aggressive=True, deep_analysis=True)
+   report_path = args.output.replace('.lua', f'_report.{args.format}')
+   with open(report_path, 'w', encoding='utf-8') as f:
+       if args.format == 'json':
+           json.dump({
+               'steps': result['steps'],
+               'heuristic_before': result['heuristic_before'],
+               'heuristic_after': result['heuristic_after'],
+               'entropy_reduction': result['entropy_reduction'],
+               'complexity_reduction': result['complexity_reduction'],
+           }, f, indent=2)
+       else:
+           f.write(result['dashboard'].export_report(result, 'html'))
    
-   print("Steps performed:", result['steps'])
-   print("\nDeobfuscated code:")
-   print(result['deobfuscated'])
-   print(f"\nEntropy reduction: {result['entropy_reduction']:.2f}")
-   print(f"Complexity reduction: {result['complexity_reduction']}")
+   if 'TERMUX' in os.environ or '/storage' in os.getcwd():
+       download_path = os.path.expanduser('\~/storage/downloads/deobfuscated.lua')
+       os.makedirs(os.path.dirname(download_path), exist_ok=True)
+       with open(download_path, 'w', encoding='utf-8') as f:
+           f.write(result['deobfuscated'])
+   
+   print('Deobfuscated code saved to', args.output)
+   print('Report saved to', report_path)
 
 if __name__ == '__main__':
    main()
+# by Shadow
